@@ -1,0 +1,73 @@
+{
+  "catalogue_version": "2026-08-24-fixture-1",
+  "models": [
+    {
+      "id": "cat-001",
+      "model": "fixture-small-instruct-q4",
+      "quantization": "Q4_K_M",
+      "distributor": "fixture-distributor",
+      "licence": "apache-2.0",
+      "licence_unresolved": false,
+      "download_size_bytes": 4200000000,
+      "memory_estimate_gb": 6.0,
+      "engine": "llama_server",
+      "download_command": "fixture-download cat-001",
+      "expected_hash": "sha256:fixture0000000000000000000000000000000000000000000000000000001",
+      "task_tags": ["chat", "coding"],
+      "context_tokens": 8192,
+      "speed_score": 9,
+      "quality_score": 5
+    },
+    {
+      "id": "cat-002",
+      "model": "fixture-medium-instruct-q5",
+      "quantization": "Q5_K_M",
+      "distributor": "fixture-distributor",
+      "licence": "apache-2.0",
+      "licence_unresolved": false,
+      "download_size_bytes": 9800000000,
+      "memory_estimate_gb": 13.5,
+      "engine": "llama_server",
+      "download_command": "fixture-download cat-002",
+      "expected_hash": "sha256:fixture0000000000000000000000000000000000000000000000000000002",
+      "task_tags": ["chat", "coding"],
+      "context_tokens": 32768,
+      "speed_score": 6,
+      "quality_score": 8
+    },
+    {
+      "id": "cat-003",
+      "model": "fixture-large-instruct-q4",
+      "quantization": "Q4_K_M",
+      "distributor": "fixture-distributor",
+      "licence": "unresolved",
+      "licence_unresolved": true,
+      "download_size_bytes": 21000000000,
+      "memory_estimate_gb": 28.0,
+      "engine": "llama_server",
+      "download_command": null,
+      "expected_hash": null,
+      "task_tags": ["chat"],
+      "context_tokens": 8192,
+      "speed_score": 3,
+      "quality_score": 9
+    },
+    {
+      "id": "cat-004",
+      "model": "fixture-embed-small",
+      "quantization": "F16",
+      "distributor": "fixture-distributor",
+      "licence": "mit",
+      "licence_unresolved": false,
+      "download_size_bytes": 400000000,
+      "memory_estimate_gb": 1.0,
+      "engine": "llama_server",
+      "download_command": "fixture-download cat-004",
+      "expected_hash": "sha256:fixture0000000000000000000000000000000000000000000000000000004",
+      "task_tags": ["embedding"],
+      "context_tokens": 512,
+      "speed_score": 10,
+      "quality_score": 4
+    }
+  ]
+}
