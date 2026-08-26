@@ -35,14 +35,6 @@ The trial does not establish production readiness, repeated-run reliability, mod
 - Confirmed serving requires the exact registered native bundle and already-held model.
 - Ordinary operation does not install an operating-system egress policy.
 
-## Selected publication target
+## Licence
 
-- Licence: Apache License 2.0.
-- Repository: `NMAIResearch/plag-in` on GitHub.
-
-## Remaining publication blockers
-
-- Authenticate the selected hosting account.
-- Build and inspect the final source archive.
-- Re-run the suite against the exact release commit.
-- Obtain explicit approval for the final remote target and payload.
+Apache License 2.0.
