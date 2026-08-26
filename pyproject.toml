@@ -1,0 +1,30 @@
+[project]
+name = "plag-in"
+version = "0.1.0a1"
+description = "Private Local AI Gateway source alpha"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+license = "Apache-2.0"
+authors = [
+  {name = "NM AI Research", email = "NMAIResearch@proton.me"},
+]
+keywords = ["local-llm", "llama-cpp", "privacy", "inference-gateway"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3.14",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.scripts]
+plag-in = "plag_in.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
