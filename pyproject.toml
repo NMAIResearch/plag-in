@@ -15,7 +15,6 @@ classifiers = [
   "Environment :: Console",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3.14",
-  "License :: OSI Approved :: Apache Software License",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 
