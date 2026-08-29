@@ -1,7 +1,13 @@
 import unittest
+from pathlib import Path
 
-from plag_in.config import load_config
-from plag_in.errors import ConfigurationError, UnknownConfigurationFieldError
+from plag_in.config import load_config, with_trial_profile
+from plag_in.errors import ConfigurationError, InvalidAliasError, UnknownConfigurationFieldError
+from tests.support import (
+    FIXTURE_COMPATIBILITY_RECORD,
+    fixture_engine_config,
+    registered_fixture_compatibility,
+)
 
 
 def _base_config(**overrides):
@@ -185,21 +191,26 @@ class LoadConfigTests(unittest.TestCase):
 
     def test_profile_binds_alias_to_configured_engine_and_model(self):
         data = _base_config(
-            engines={"worker": {"executable": "/bin/false"}},
+            engines={"worker": fixture_engine_config(Path("/tmp/lib/libllama.so"))},
             profiles={
                 "fixture-model": {
                     "model_path": "/tmp/models/fixture.gguf",
                     "engine": "worker",
                     "display_name": "Fixture model",
                     "compatibility_status": "tested",
+                    "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
                 }
             },
         )
-        config = load_config(data)
+        with registered_fixture_compatibility():
+            config = load_config(data)
         profile = config.profiles["fixture-model"]
         self.assertEqual(profile.engine, "worker")
         self.assertEqual(profile.display_name, "Fixture model")
         self.assertEqual(profile.compatibility_status, "tested")
+        self.assertEqual(
+            profile.compatibility_record, FIXTURE_COMPATIBILITY_RECORD.record_id
+        )
 
     def test_profile_rejects_unconfigured_engine(self):
         with self.assertRaises(ConfigurationError):
@@ -456,6 +467,70 @@ class NativePathTypeValidationTests(unittest.TestCase):
     def test_empty_string_executable_is_rejected(self):
         with self.assertRaises(ConfigurationError):
             load_config(_base_config(engines={"worker": {"executable": ""}}))
+
+
+class TrialProfileTests(unittest.TestCase):
+    """Probe 2: an unverified model is selectable without a persistent change."""
+
+    def _config(self):
+        with registered_fixture_compatibility():
+            return load_config(
+                _base_config(
+                    engines={"worker": fixture_engine_config(Path("/tmp/lib/libllama.so"))},
+                    profiles={
+                        "tested-alias": {
+                            "model_path": "/tmp/models/tested.gguf",
+                            "engine": "worker",
+                            "display_name": "Tested Fixture",
+                            "compatibility_status": "tested",
+                            "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
+                        }
+                    },
+                )
+            )
+
+    def test_trial_profile_is_always_unverified(self):
+        config = self._config()
+        trial = with_trial_profile(
+            config, "trial-held", Path("/tmp/models/held.gguf"), "worker", "held:latest"
+        )
+        self.assertEqual(trial.profiles["trial-held"].compatibility_status, "unverified")
+        self.assertEqual(trial.profiles["trial-held"].display_name, "held:latest")
+
+    def test_the_original_configuration_object_is_not_mutated(self):
+        config = self._config()
+        with_trial_profile(
+            config, "trial-held", Path("/tmp/models/held.gguf"), "worker", "held:latest"
+        )
+        self.assertEqual(sorted(config.profiles), ["tested-alias"])
+
+    def test_the_tested_profile_survives_unchanged(self):
+        config = self._config()
+        trial = with_trial_profile(
+            config, "trial-held", Path("/tmp/models/held.gguf"), "worker", "held:latest"
+        )
+        self.assertEqual(trial.profiles["tested-alias"], config.profiles["tested-alias"])
+
+    def test_an_existing_alias_is_refused_rather_than_shadowed(self):
+        config = self._config()
+        with self.assertRaises(ConfigurationError):
+            with_trial_profile(
+                config, "tested-alias", Path("/tmp/models/held.gguf"), "worker", "held:latest"
+            )
+
+    def test_an_unconfigured_engine_is_refused(self):
+        config = self._config()
+        with self.assertRaises(ConfigurationError):
+            with_trial_profile(
+                config, "trial-held", Path("/tmp/models/held.gguf"), "absent", "held:latest"
+            )
+
+    def test_an_invalid_alias_is_refused(self):
+        config = self._config()
+        with self.assertRaises(InvalidAliasError):
+            with_trial_profile(
+                config, "held:latest", Path("/tmp/models/held.gguf"), "worker", "held:latest"
+            )
 
 
 if __name__ == "__main__":

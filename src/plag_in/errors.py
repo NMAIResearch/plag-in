@@ -134,6 +134,19 @@ class ReceiptCheckpointError(ReceiptPersistenceError):
     error_type = "receipt_checkpoint_failed"
 
 
+class ReceiptMigrationRequiredError(ReceiptPersistenceError):
+    """A store holding pre-version-5 records cannot accept a version 5 append.
+
+    Mixing schema generations in one store would place two field contracts
+    under one chain, so the append is refused and the operator is directed to
+    initialise a separate current-schema store. Neither the legacy store nor
+    its checkpoint is modified.
+    """
+
+    error_type = "receipt_migration_required"
+    http_status = 409
+
+
 class RequestTimeoutError(PlagInError):
     error_type = "request_timeout"
     http_status = 408

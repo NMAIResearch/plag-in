@@ -13,13 +13,16 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_FILES = {
     ".gitignore",
+    "CLIENT_INTERFACE.md",
     "LICENSE",
     "MANIFEST.in",
+    "PRODUCT_SPEC.md",
     "README.md",
     "RELEASE_NOTES.md",
     "SECURITY.md",
     "docs/VERIFICATION.md",
     "pyproject.toml",
+    "tools/verify_inference_receipts.py",
 }
 FORBIDDEN_TOP_LEVEL = {
     "evidence",
@@ -41,6 +44,8 @@ FORBIDDEN_PATTERNS = {
     "aws_access_key": re.compile("AK" + r"IA[0-9A-Z]{16}"),
     "private_key": re.compile("BEGIN " + r"(?:RSA|OPENSSH|EC|DSA) PRIVATE KEY"),
 }
+FORBIDDEN_TOP_LEVEL_PREFIXES = ("CLAUDE_", "CODEX_", "LIVE_")
+FORBIDDEN_PARTS = {"__pycache__", ".venv", "build", "dist"}
 TEXT_SUFFIXES = {".cfg", ".csv", ".ini", ".json", ".md", ".py", ".toml", ".txt"}
 
 
@@ -92,6 +97,14 @@ def main() -> int:
             failures.append(f"forbidden top-level release path: {name}")
     for name in sorted(FORBIDDEN_NAMES & relative_paths):
         failures.append(f"forbidden internal release file: {name}")
+    for relative in sorted(relative_paths):
+        relative_path = Path(relative)
+        if relative_path.parts and relative_path.parts[0].startswith(FORBIDDEN_TOP_LEVEL_PREFIXES):
+            failures.append(f"forbidden top-level release path: {relative}")
+        if any(part in FORBIDDEN_PARTS or part.endswith(".egg-info") for part in relative_path.parts):
+            failures.append(f"forbidden generated release path: {relative}")
+        if relative.endswith(".pyc") or ".bak-" in relative:
+            failures.append(f"forbidden generated release path: {relative}")
 
     scanned = 0
     for path in paths:

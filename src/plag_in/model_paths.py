@@ -8,10 +8,70 @@ outside it would be (CODEX_REVIEW_MVP_2026-08-25.md F7).
 from __future__ import annotations
 
 import json
+import os
+import stat
+from dataclasses import dataclass
 from pathlib import Path
 
 from plag_in.errors import ModelIdentityMismatchError, PathContainmentError
-from plag_in.identity import ModelIdentity
+from plag_in.identity import ModelIdentity, is_manifest_digest, manifest_digest_hex
+
+
+@dataclass(frozen=True)
+class ModelFileWitness:
+    """What file the inspected bytes came from, taken at inspection time.
+
+    Inspection and native load are separate steps, so the file named at the
+    first can be replaced before the second. The complete-byte digest is
+    re-verified by the embedded engine immediately before any native call;
+    this witness closes the narrower gap where the same path names a
+    different file whose length happens to match.
+    """
+
+    path: str
+    device: int
+    inode: int
+    size_bytes: int
+    mtime_ns: int
+
+
+def witness_model_file(path: Path | str) -> ModelFileWitness:
+    """Record the file identity of the model that was inspected."""
+    resolved = Path(path)
+    try:
+        info = os.lstat(resolved)
+    except OSError as exc:
+        raise ModelIdentityMismatchError(
+            "the selected model file could not be inspected",
+            requested_path=str(resolved),
+            reason=str(exc),
+        ) from exc
+    if not stat.S_ISREG(info.st_mode):
+        raise ModelIdentityMismatchError(
+            "the selected model path is not a regular file",
+            requested_path=str(resolved),
+        )
+    return ModelFileWitness(
+        path=str(resolved),
+        device=info.st_dev,
+        inode=info.st_ino,
+        size_bytes=info.st_size,
+        mtime_ns=info.st_mtime_ns,
+    )
+
+
+def verify_model_unchanged(witness: ModelFileWitness) -> None:
+    """Refuse when the inspected file is no longer the file at that path."""
+    current = witness_model_file(witness.path)
+    if current != witness:
+        raise ModelIdentityMismatchError(
+            "the selected model file changed after it was inspected; no model was started",
+            requested_path=witness.path,
+            inspected_inode=witness.inode,
+            observed_inode=current.inode,
+            inspected_size_bytes=witness.size_bytes,
+            observed_size_bytes=current.size_bytes,
+        )
 
 
 def _within(path: Path, root: Path) -> bool:
@@ -33,11 +93,11 @@ def _resolve_held_ollama_blob(requested: Path, store_root: Path) -> ModelIdentit
     filename = requested.name
     if not filename.startswith("sha256-"):
         return None
-    declared_hex = filename[len("sha256-"):]
-    if len(declared_hex) != 64 or any(char not in "0123456789abcdef" for char in declared_hex):
+    declared = f"sha256:{filename[len('sha256-'):]}"
+    if not is_manifest_digest(declared):
         return None
+    declared_hex = manifest_digest_hex(declared)
 
-    declared = f"sha256:{declared_hex}"
     found = False
     for manifest_path in sorted(manifests_dir.rglob("*")):
         if not manifest_path.is_file():

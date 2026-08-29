@@ -10,12 +10,14 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from plag_in.aliasing import validate_alias
+from plag_in.compatibility_records import find_compatibility_record
 from plag_in.errors import ConfigurationError, UnknownConfigurationFieldError
+from plag_in.native_profiles import identify_native_abi_profile
 
 _VALID_ORIGINS = {"loopback", "any"}
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -55,7 +57,13 @@ _RUNTIME_KEYS = {
     "temperature",
     "top_p",
 }
-_PROFILE_KEYS = {"model_path", "engine", "display_name", "compatibility_status"}
+_PROFILE_KEYS = {
+    "model_path",
+    "engine",
+    "display_name",
+    "compatibility_status",
+    "compatibility_record",
+}
 
 _LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost"}
 
@@ -185,10 +193,18 @@ class EngineConfig:
 
 @dataclass(frozen=True)
 class ModelProfile:
+    """One configured alias and the evidence behind its compatibility state.
+
+    `compatibility_record` names a reviewed record in the source, and is set
+    only when `compatibility_status` is `tested`. The status field alone is
+    an operator assertion and is never treated as evidence (D-021).
+    """
+
     model_path: Path
     engine: str
     display_name: str
     compatibility_status: str
+    compatibility_record: str | None = None
 
 
 @dataclass(frozen=True)
@@ -259,6 +275,113 @@ class GatewayConfig:
     runtime: RuntimeConfig = field(default_factory=RuntimeConfig)
     recommend_catalogue: Path | None = None
     profiles: dict[str, ModelProfile] = field(default_factory=dict)
+
+
+def _validate_compatibility_evidence(
+    *,
+    alias: str,
+    profile_data: dict,
+    compatibility_status: str,
+    engine_name: str,
+    engine_cfg: "EngineConfig",
+) -> str | None:
+    """Refuse a `tested` profile that is not backed by a reviewed record.
+
+    Configuration may reference a record, never supply one, so a profile
+    cannot assert `tested` for a model no reviewed trial covers. The record
+    also names the exact native bundle that loaded the model, which is
+    checked here against the engine's verified component digests. The model
+    bytes themselves are checked where they are read, at serve.
+    """
+    declared = profile_data.get("compatibility_record")
+
+    if compatibility_status != "tested":
+        if declared is not None:
+            raise ConfigurationError(
+                f"profiles.{alias}.compatibility_record is only valid with "
+                "compatibility_status 'tested'",
+                alias=alias,
+                compatibility_status=compatibility_status,
+            )
+        return None
+
+    if declared is None:
+        raise ConfigurationError(
+            f"profiles.{alias}.compatibility_status 'tested' requires "
+            "compatibility_record naming a reviewed compatibility record",
+            alias=alias,
+        )
+    record_id = _require_nonempty_str(declared, f"profiles.{alias}.compatibility_record")
+    record = find_compatibility_record(record_id)
+    if record is None:
+        raise ConfigurationError(
+            f"profiles.{alias}.compatibility_record names no reviewed compatibility record",
+            alias=alias,
+            compatibility_record=record_id,
+        )
+
+    if engine_cfg.kind != "embedded":
+        raise ConfigurationError(
+            f"profiles.{alias} claims a compatibility record, but engine "
+            f"{engine_name!r} declares no native component digests to match it",
+            alias=alias,
+            engine=engine_name,
+            compatibility_record=record_id,
+            required_native_abi_profile=record.native_abi_profile_id,
+        )
+
+    observed = identify_native_abi_profile(
+        upstream_identity=engine_cfg.upstream_identity,
+        library_sha256=engine_cfg.library_sha256,
+        ggml_base_library_sha256=engine_cfg.ggml_base_library_sha256,
+        ggml_library_sha256=engine_cfg.ggml_library_sha256,
+        backend_library_sha256=tuple(item.sha256 for item in engine_cfg.backend_libraries),
+    )
+    if observed is None or observed.profile_id != record.native_abi_profile_id:
+        raise ConfigurationError(
+            f"profiles.{alias} engine {engine_name!r} is not the native bundle "
+            "the reviewed compatibility record was completed against",
+            alias=alias,
+            engine=engine_name,
+            compatibility_record=record_id,
+            required_native_abi_profile=record.native_abi_profile_id,
+            observed_native_abi_profile=observed.profile_id if observed else None,
+        )
+    return record_id
+
+
+def with_trial_profile(
+    config: GatewayConfig,
+    alias: str,
+    model_path: Path,
+    engine: str,
+    display_name: str,
+) -> GatewayConfig:
+    """Return a copy carrying one ephemeral unverified profile.
+
+    A trial profile exists for the life of one process and is never written
+    to a configuration file: trying a model must not change what the
+    computer is configured to serve (D-021). The returned profile is always
+    `unverified`, so no trial can promote a model, and an alias already
+    declared in the configuration is refused rather than shadowed.
+    """
+    validate_alias(alias)
+    if alias in config.profiles:
+        raise ConfigurationError(
+            f"trial alias is already a configured profile: {alias!r}", alias=alias
+        )
+    if engine not in config.engines:
+        raise ConfigurationError(
+            f"trial profile refers to an unconfigured engine: {engine!r}", engine=engine
+        )
+    profiles = dict(config.profiles)
+    profiles[alias] = ModelProfile(
+        model_path=Path(model_path),
+        engine=engine,
+        display_name=display_name,
+        compatibility_status="unverified",
+    )
+    return replace(config, profiles=profiles)
 
 
 def load_config(data: dict) -> GatewayConfig:
@@ -481,6 +604,13 @@ def load_config(data: dict) -> GatewayConfig:
             raise ConfigurationError(
                 f"profiles.{alias}.compatibility_status must be 'tested' or 'unverified'"
             )
+        compatibility_record = _validate_compatibility_evidence(
+            alias=alias,
+            profile_data=profile_data,
+            compatibility_status=compatibility_status,
+            engine_name=engine_name,
+            engine_cfg=engines[engine_name],
+        )
         profiles[alias] = ModelProfile(
             model_path=Path(
                 _require_nonempty_str(profile_data["model_path"], f"profiles.{alias}.model_path")
@@ -490,6 +620,7 @@ def load_config(data: dict) -> GatewayConfig:
                 profile_data["display_name"], f"profiles.{alias}.display_name"
             ),
             compatibility_status=compatibility_status,
+            compatibility_record=compatibility_record,
         )
 
     return GatewayConfig(

@@ -14,12 +14,17 @@ import tempfile
 from pathlib import Path
 from typing import Callable, TextIO
 
+from plag_in.compatibility_records import REGISTERED_COMPATIBILITY_RECORDS
 from plag_in.identity import hash_file
 from plag_in.input_control import confirm_action
 from plag_in.native_profiles import REGISTERED_NATIVE_ABI_PROFILES
 
 
 _TESTED_ABI = REGISTERED_NATIVE_ABI_PROFILES[0]
+# The setup path configures exactly what a reviewed record admits, so the
+# model digest is read from that record rather than restated here. Two
+# copies of one digest can drift; one cannot.
+_TESTED_RECORD = REGISTERED_COMPATIBILITY_RECORDS[0]
 _TESTED_BUNDLE = {
     "upstream_identity": _TESTED_ABI.upstream_identity,
     "files": {
@@ -45,7 +50,8 @@ _TESTED_BUNDLE = {
         ),
     },
     "model_manifest": "manifests/registry.ollama.ai/library/qwen2.5/3b",
-    "model_digest": "5ee4f07cdb9beadbbb293e85803c569b01bd37ed059d2715faa7bb405f31caa6",
+    "model_digest": _TESTED_RECORD.model_sha256,
+    "compatibility_record": _TESTED_RECORD.record_id,
     "alias": "qwen25-3b",
     "display_name": "Qwen2.5 3B",
 }
@@ -57,8 +63,45 @@ def default_config_path() -> Path:
 
 
 def default_state_path() -> Path:
-    root = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local" / "state"))
-    return root / "plag-in"
+    """The state path the product chooses when the operator declares none.
+
+    A pathname is not authority over what it reaches. An environment variable,
+    or the home anchor the operating system reports, selects a pathname; it does
+    not establish that a link target substituted anywhere inside that pathname
+    is one the product may write to. So the default is assembled from spellings
+    and every component of the result is proved afterwards by the confined walk,
+    which refuses a link at any of them.
+
+    One exception is drawn as narrowly as the host requires. The home anchor
+    itself, and nothing below it, is canonicalised, because a host may reach the
+    user's home through a compatibility link: on this one `/home` is a link to
+    `/var/home`, so the product's own default would otherwise be refused by the
+    product's own rule with nothing the operator could do about it. The anchor
+    is what the operating system reports as the user's home, and translating it
+    changes no decision the operator made. The `.local`, `state` and `plag-in`
+    components are appended to the translated anchor as spellings and are never
+    resolved.
+
+    A non-empty `XDG_STATE_HOME` is used without symbolic-link resolution: no
+    component of it is followed, and the walk refuses any link inside it. The
+    spelling itself is still subject to ordinary path normalisation, so a
+    trailing separator or a `..` component is normalised rather than preserved
+    byte for byte. Canonicalising the whole root followed a link at `.local`, at
+    `state` or at any component of that variable and handed the walk the
+    selected target, which has no linked component left to refuse (independent
+    review of the C1-R1 repair, C1-R2).
+
+    An empty `XDG_STATE_HOME` selects the home fallback rather than the
+    variable. Taking an empty value as supplied would select a bare relative
+    `plag-in` beneath whatever the working directory happens to be, which is not
+    a state location the product should choose for itself (independent review of
+    the C1-R2 repair, R2-F1).
+    """
+    xdg_state_home = os.environ.get("XDG_STATE_HOME")
+    if xdg_state_home:
+        return Path(xdg_state_home) / "plag-in"
+    home_anchor = Path(os.path.realpath(str(Path.home())))
+    return home_anchor / ".local" / "state" / "plag-in"
 
 
 def detect_tested_candidate(
@@ -77,6 +120,7 @@ def detect_tested_candidate(
         "model": {"status": "unavailable"},
         "alias": spec["alias"],
         "display_name": spec["display_name"],
+        "compatibility_record": spec.get("compatibility_record"),
     }
     if result["platform_status"] != "matched":
         return result
@@ -134,6 +178,10 @@ def build_config(candidate: dict, api_secret: str) -> dict:
     """Build the local tested profile after candidate identity matching."""
     if not candidate.get("available"):
         raise ValueError("tested local candidate is unavailable")
+    if not candidate.get("compatibility_record"):
+        raise ValueError(
+            "tested local candidate carries no reviewed compatibility record"
+        )
     native = candidate["native_files"]
     alias = candidate["alias"]
     return {
@@ -166,6 +214,7 @@ def build_config(candidate: dict, api_secret: str) -> dict:
                 "engine": "libllama",
                 "display_name": candidate["display_name"],
                 "compatibility_status": "tested",
+                "compatibility_record": candidate["compatibility_record"],
             }
         },
         "bind": {"host": "127.0.0.1", "port": 19080},

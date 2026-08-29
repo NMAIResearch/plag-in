@@ -13,6 +13,11 @@ from plag_in.setup_flow import (
     detect_tested_candidate,
     write_config,
 )
+from tests.support import (
+    FIXTURE_COMPATIBILITY_RECORD,
+    abi_profile_from_native_files,
+    registered_fixture_compatibility,
+)
 
 
 class SetupFlowTests(unittest.TestCase):
@@ -59,17 +64,28 @@ class SetupFlowTests(unittest.TestCase):
             "files": file_specs,
             "model_manifest": manifest_relative,
             "model_digest": model_digest,
+            "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
             "alias": "fixture-1b",
             "display_name": "Fixture 1B",
         }
         return detect_tested_candidate(runtime, models, bundle=bundle)
+
+    def _registered(self, candidate: dict):
+        """Register the reviewed record this scratch candidate stands for."""
+        return registered_fixture_compatibility(
+            model_sha256=candidate["model"]["declared_sha256"],
+            abi_profile=abi_profile_from_native_files(
+                candidate["native_files"], candidate["upstream_identity"]
+            ),
+        )
 
     def test_exact_candidate_builds_a_valid_scoped_config(self):
         with tempfile.TemporaryDirectory() as tmp:
             candidate = self._candidate(Path(tmp))
             self.assertTrue(candidate["available"])
             data = build_config(candidate, "s" * 64)
-            config = load_config(data)
+            with self._registered(candidate):
+                config = load_config(data)
         self.assertEqual(set(config.profiles), {"fixture-1b"})
         self.assertEqual(config.profiles["fixture-1b"].compatibility_status, "tested")
         self.assertEqual(config.security.api_keys[0].aliases, ("fixture-1b",))
@@ -81,7 +97,8 @@ class SetupFlowTests(unittest.TestCase):
             candidate = self._candidate(root)
             target = root / "config" / "config.json"
             write_config(target, build_config(candidate, "s" * 64))
-            loaded = load_config_file(target)
+            with self._registered(candidate):
+                loaded = load_config_file(target)
             mode = os.stat(target).st_mode & 0o777
         self.assertIn("fixture-1b", loaded.profiles)
         self.assertEqual(mode, 0o600)
@@ -106,15 +123,17 @@ class SetupFlowTests(unittest.TestCase):
             root = Path(tmp)
             target = root / "config.json"
             output = io.StringIO()
+            candidate = self._candidate(root)
             result = configure_tested_model(
                 input_fn=lambda _: "yes",
                 output=output,
                 config_path=target,
-                candidate=self._candidate(root),
+                candidate=candidate,
             )
             self.assertEqual(result, target.resolve())
             self.assertTrue(target.is_file())
-            self.assertIn("fixture-1b", load_config_file(target).profiles)
+            with self._registered(candidate):
+                self.assertIn("fixture-1b", load_config_file(target).profiles)
 
     def test_escape_poisoned_confirmation_reprompts_then_writes_once(self):
         with tempfile.TemporaryDirectory() as tmp:

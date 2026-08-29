@@ -4,10 +4,13 @@ from __future__ import annotations
 import contextlib
 import socket
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
+from unittest.mock import patch
 
+from plag_in.compatibility_records import CompatibilityRecord
 from plag_in.config import ApiKey, BindConfig, GatewayConfig, SecurityConfig
+from plag_in.native_profiles import NativeAbiProfile
 from plag_in.engines.llama_server import LlamaServerAdapter
 from plag_in.gateway import BackendInfo, GatewayContext, GatewayServer
 from plag_in.identity import ModelIdentity, canonical_digest
@@ -35,6 +38,95 @@ def python_executable() -> str:
     return sys.executable
 
 
+FIXTURE_NATIVE_ABI_PROFILE = NativeAbiProfile(
+    profile_id="fixture-native-abi",
+    upstream_identity="fixture",
+    library_sha256="a" * 64,
+    ggml_base_library_sha256="b" * 64,
+    ggml_library_sha256="c" * 64,
+    backend_library_sha256=("d" * 64,),
+)
+
+FIXTURE_COMPATIBILITY_RECORD = CompatibilityRecord(
+    record_id="fixture-compatibility-record",
+    model_sha256="e" * 64,
+    native_abi_profile_id=FIXTURE_NATIVE_ABI_PROFILE.profile_id,
+    decision_id="D-021",
+    reviewed_on="2026-08-29",
+    trial_report="tests/support.py",
+    trial_report_sha256="f" * 64,
+)
+
+
+@contextlib.contextmanager
+def registered_fixture_compatibility(
+    model_sha256: str | None = None,
+    abi_profile: NativeAbiProfile | None = None,
+):
+    """Register one scratch native profile and compatibility record.
+
+    `tested` is admitted only by a record in the reviewed source, so a test
+    that needs a tested profile registers its own scratch pair here rather
+    than asserting `tested` from a status string. A test whose fixture
+    builds real native files passes the profile it observed, because a
+    digest cannot be chosen in advance. The registries are restored on exit,
+    and nothing outside this context sees either entry.
+    """
+    profile = abi_profile or FIXTURE_NATIVE_ABI_PROFILE
+    record = replace(
+        FIXTURE_COMPATIBILITY_RECORD, native_abi_profile_id=profile.profile_id
+    )
+    if model_sha256 is not None:
+        record = replace(record, model_sha256=model_sha256)
+    with (
+        patch(
+            "plag_in.native_profiles.REGISTERED_NATIVE_ABI_PROFILES",
+            (profile,),
+        ),
+        patch(
+            "plag_in.compatibility_records.REGISTERED_COMPATIBILITY_RECORDS",
+            (record,),
+        ),
+    ):
+        yield record
+
+
+def abi_profile_from_native_files(
+    native_files: dict, upstream_identity: str, profile_id: str = "fixture-native-abi"
+) -> NativeAbiProfile:
+    """The registered profile a `detect_tested_candidate` result would match."""
+    return NativeAbiProfile(
+        profile_id=profile_id,
+        upstream_identity=upstream_identity,
+        library_sha256=native_files["library"]["observed_sha256"],
+        ggml_base_library_sha256=native_files["ggml_base_library"]["observed_sha256"],
+        ggml_library_sha256=native_files["ggml_library"]["observed_sha256"],
+        backend_library_sha256=(
+            native_files["cuda_backend"]["observed_sha256"],
+            native_files["cpu_backend"]["observed_sha256"],
+        ),
+    )
+
+
+def fixture_engine_config(library_path: Path) -> dict:
+    """An embedded engine whose component digests match the fixture profile."""
+    return {
+        "library": str(library_path),
+        "library_sha256": FIXTURE_NATIVE_ABI_PROFILE.library_sha256,
+        "ggml_base_library": str(library_path),
+        "ggml_base_library_sha256": FIXTURE_NATIVE_ABI_PROFILE.ggml_base_library_sha256,
+        "ggml_library": str(library_path),
+        "ggml_library_sha256": FIXTURE_NATIVE_ABI_PROFILE.ggml_library_sha256,
+        "backend_libraries": [
+            {
+                "path": str(library_path),
+                "sha256": FIXTURE_NATIVE_ABI_PROFILE.backend_library_sha256[0],
+            }
+        ],
+        "upstream_identity": FIXTURE_NATIVE_ABI_PROFILE.upstream_identity,
+    }
+
+
 @dataclass
 class GatewayStack:
     supervisor: Supervisor
@@ -60,6 +152,7 @@ def build_gateway_stack(
     auth_mode: str = "none",
     api_keys: tuple[ApiKey, ...] = (),
     with_tool_call: bool = False,
+    receipt_store=None,
 ) -> GatewayStack:
     """Stand up a real (loopback) fake engine plus a real gateway server, entirely on scratch state."""
     tmp_dir = Path(tmp_dir)
@@ -106,7 +199,11 @@ def build_gateway_stack(
 
     receipts_path = tmp_dir / "receipts.jsonl"
     hmac_key_path = tmp_dir / "receipts.jsonl.hmac_key"
-    receipt_store = ReceiptStore(receipts_path, hmac_key_path=hmac_key_path)
+    # `receipt_store` lets a caller serve through a writer that follows the
+    # active-store pointer, so a store activated while this gateway runs can be
+    # observed through the running listener rather than inferred from source.
+    if receipt_store is None:
+        receipt_store = ReceiptStore(receipts_path, hmac_key_path=hmac_key_path)
     context = GatewayContext(config, registry, receipt_store, ENGINE_ADAPTERS)
     direct_record = config.runtime.as_direct_record()
     context.register_backend(

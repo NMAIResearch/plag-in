@@ -141,6 +141,18 @@ class RuntimeSourceDigestTests(unittest.TestCase):
             with self.assertRaises(PathContainmentError):
                 compute_source_tree_digest(root)
 
+    def test_symlinked_source_directory_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = Path(tmp) / "outside"
+            outside.mkdir()
+            (outside / "external.py").write_bytes(b"outside = True\n")
+            root = Path(tmp) / "pkg"
+            root.mkdir()
+            (root / "keep.py").write_bytes(b"inside = True\n")
+            (root / "linked_package").symlink_to(outside, target_is_directory=True)
+            with self.assertRaises(PathContainmentError):
+                compute_source_tree_digest(root)
+
     def test_empty_source_tree_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "empty"

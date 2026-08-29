@@ -11,6 +11,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import types
 import unittest
@@ -420,6 +422,69 @@ class NullPointerLoadTests(unittest.TestCase):
         self._assert_load_fails_and_cleans_up("llama_model_chat_template")
 
 
+class LoadFailureNeverAnnouncesReadinessTests(unittest.TestCase):
+    """Probe 9: a refused model never reaches a ready listener state.
+
+    `ready()` is what the gateway's `/ready` route and the session start
+    path consult, so a load that failed must leave it false at every
+    failure point, with every acquired handle already released.
+    """
+
+    FAILURE_POINTS = (
+        # An architecture libllama cannot build is a null model pointer.
+        "llama_model_load_from_file",
+        "llama_init_from_model",
+        "llama_model_get_vocab",
+        # No usable embedded chat template.
+        "llama_model_chat_template",
+    )
+
+    def test_no_failure_point_leaves_the_backend_ready(self):
+        for fail_at in self.FAILURE_POINTS:
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as tmp:
+                backend = _build_backend(Path(tmp))
+                self.assertFalse(backend.ready())
+                with patch("ctypes.CDLL", side_effect=_make_fake_cdll([], fail_at=fail_at)):
+                    with self.assertRaises(NativeRuntimeError):
+                        backend.load()
+                self.assertFalse(backend.ready())
+                backend.close()
+                self.assertFalse(backend.ready())
+
+    def test_no_failure_point_leaves_a_runtime_profile_or_template_digest(self):
+        for fail_at in self.FAILURE_POINTS:
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as tmp:
+                backend = _build_backend(Path(tmp))
+                with patch("ctypes.CDLL", side_effect=_make_fake_cdll([], fail_at=fail_at)):
+                    with self.assertRaises(NativeRuntimeError):
+                        backend.load()
+                with self.assertRaises(NativeRuntimeError):
+                    _ = backend.runtime_profile
+                with self.assertRaises(NativeRuntimeError):
+                    _ = backend.template_digest
+
+    def test_no_failure_point_leaves_a_loaded_backend_handle(self):
+        for fail_at in self.FAILURE_POINTS:
+            with self.subTest(fail_at=fail_at), tempfile.TemporaryDirectory() as tmp:
+                backend = _build_backend(Path(tmp))
+                with patch("ctypes.CDLL", side_effect=_make_fake_cdll([], fail_at=fail_at)):
+                    with self.assertRaises(NativeRuntimeError):
+                        backend.load()
+                self.assertEqual(backend._backend_handles, [])
+                self.assertIsNone(backend._ggml)
+                self.assertIsNone(backend._ggml_base)
+                self.assertFalse(backend._backend_initialized)
+
+    def test_a_successful_load_is_the_only_route_to_ready(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            backend = _build_backend(Path(tmp))
+            with patch("ctypes.CDLL", side_effect=_make_fake_cdll([])):
+                backend.load()
+                self.assertTrue(backend.ready())
+                backend.close()
+            self.assertFalse(backend.ready())
+
+
 class LogSuppressionTests(unittest.TestCase):
     """Regression 5: a fixture native log line never reaches stdout/stderr."""
 
@@ -687,7 +752,11 @@ class EmbeddedGatewayRouteTests(unittest.TestCase):
             self.assertEqual(body["choices"][0]["message"]["content"], "fixture")
             receipt = store.get(headers["X-PLAG-IN-Receipt-ID"])
             self.assertEqual(receipt["backend_address"], "in_process")
-            self.assertEqual(receipt["runtime_profile"]["engine"], "libllama_embedded")
+            self.assertEqual(receipt["plag_in_adapter_record"]["engine"], "libllama_embedded")
+            self.assertEqual(
+                sorted(receipt["runtime_profile"]),
+                ["effective", "measurement_status", "requested"],
+            )
             self.assertEqual(receipt["inference_mode"], "embedded")
             self.assertIsNone(receipt["engine_executable_digest"])
             self.assertIsNone(receipt["argv_digest"])
@@ -695,6 +764,21 @@ class EmbeddedGatewayRouteTests(unittest.TestCase):
             self.assertEqual(receipt["upstream_identity"], "fixture-upstream")
             self.assertEqual(receipt["measurement_status"]["gpu_layers"], "unassessed")
             self.assertEqual(receipt["gpu_offload"]["status"], "unassessed")
+            # R3-F2: the embedded path must satisfy the reference verifier on
+            # the same terms as the worker path, checked against the bytes this
+            # route actually wrote rather than a fixture receipt.
+            tool = Path(__file__).resolve().parents[2] / "tools" / "verify_inference_receipts.py"
+            verified = subprocess.run(
+                [
+                    sys.executable, str(tool), str(store.path),
+                    "--hmac-key", str(store.hmac_key_path),
+                    "--checkpoint", str(store.path) + ".checkpoint",
+                ],
+                capture_output=True, text=True, timeout=120,
+            )
+            self.assertEqual(verified.returncode, 0, verified.stdout)
+            self.assertIn("result=valid", verified.stdout)
+
             capabilities = context.capabilities_document(None)
             self.assertEqual(capabilities["endpoints"]["chat_completions"], "declared")
             self.assertEqual(capabilities["tool_call_transport_status"], "unknown")

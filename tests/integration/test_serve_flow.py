@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plag_in.errors import BackendUnavailableError, RequestCancelledError
+from plag_in.gateway import MAX_CONCURRENT_CHAT_REQUESTS
 from plag_in.identity import RUNTIME_SOURCE_SCOPE
 from tests.support import build_gateway_stack
 
@@ -70,6 +71,17 @@ def _post(base_url, path, body, headers=None):
             exc.close()
 
 
+def _post_stream(base_url, path, body, headers=None):
+    data = json.dumps(body).encode("utf-8")
+    hdrs = {"Content-Type": "application/json"}
+    hdrs.update(headers or {})
+    req = urllib.request.Request(
+        f"{base_url}{path}", data=data, headers=hdrs, method="POST"
+    )  # noqa: S310
+    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+        return resp.status, resp.read(), resp.headers
+
+
 class ServeFlowTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -105,6 +117,23 @@ class ServeFlowTests(unittest.TestCase):
         self.assertIn("choices", body)
         self.assertIsNotNone(headers.get("X-PLAG-IN-Request-ID"))
         self.assertEqual(headers.get("X-PLAG-IN-Locality-Level"), "L1")
+
+    def test_streaming_request_returns_buffered_sse_and_receipt_headers(self):
+        status, raw, headers = _post_stream(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {
+                "model": "fixture-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(headers.get_content_type(), "text/event-stream")
+        self.assertIn(b'"object":"chat.completion.chunk"', raw)
+        self.assertIn(b'"content":"fake response', raw)
+        self.assertTrue(raw.endswith(b"data: [DONE]\n\n"))
+        self.assertIsNotNone(headers.get("X-PLAG-IN-Receipt-ID"))
 
     def test_client_disconnect_cancels_embedded_backend_work(self):
         fixture = _CancellableEmbeddedFixture()
@@ -184,13 +213,29 @@ class ServeFlowTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual(receipt["model_alias"], "fixture-alias")
         self.assertEqual(receipt["status"], "completed")
-        self.assertEqual(receipt["runtime_profile"]["engine"], "llama_server_direct")
-        self.assertFalse(receipt["runtime_profile"]["ollama_runtime_dependency"])
-        self.assertEqual(receipt["runtime_profile"]["arguments"]["context_size"], 8192)
+        # Schema v4: the adapter's own record moved to a namespaced field and
+        # `runtime_profile` carries the portable specification shape, so a
+        # worker receipt passes the reference verifier (R3-F2).
+        self.assertEqual(receipt["plag_in_adapter_record"]["engine"], "llama_server_direct")
+        self.assertFalse(receipt["plag_in_adapter_record"]["ollama_runtime_dependency"])
+        self.assertEqual(receipt["plag_in_adapter_record"]["arguments"]["context_size"], 8192)
+        self.assertEqual(
+            sorted(receipt["runtime_profile"]), ["effective", "measurement_status", "requested"]
+        )
+        self.assertEqual(receipt["runtime_profile"]["requested"]["context_size"], 8192)
+        # The worker adapter queries no effective value, so nothing is measured
+        # and the reason stays in the adapter record rather than being invented
+        # as a measurement here.
+        self.assertEqual(receipt["runtime_profile"]["effective"], {})
+        self.assertEqual(receipt["runtime_profile"]["measurement_status"], {})
+        self.assertEqual(
+            receipt["plag_in_adapter_record"]["measurement_status"],
+            "not_applicable_to_worker_adapter",
+        )
         # Regression 11: a worker receipt preserves its declared
         # compatibility (worker-era identity) fields under the new schema,
         # and carries no embedded-only native identity (handoff 07 item C).
-        self.assertEqual(receipt["schema_version"], "3")
+        self.assertEqual(receipt["schema_version"], "5")
         self.assertEqual(receipt["inference_mode"], "worker")
         self.assertEqual(len(receipt["engine_executable_digest"]), 64)
         self.assertEqual(len(receipt["argv_digest"]), 64)
@@ -245,7 +290,7 @@ class ServeFlowTests(unittest.TestCase):
         # inference mode and per-field measurement status truthfully; a
         # requested GPU offload with no verified measurement route stays
         # `unassessed`, never inferred from a requested layer count.
-        self.assertEqual(doc["receipt_schema_version"], "3")
+        self.assertEqual(doc["receipt_schema_version"], "5")
         self.assertIn("locality_evidence_class", doc)
         self.assertEqual(profile["inference_mode"], "worker")
         self.assertEqual(profile["gpu_offload"]["status"], "unassessed")
@@ -317,6 +362,273 @@ class ServeFlowTests(unittest.TestCase):
         status, body, _headers = _post(self.stack.server.base_url, "/v1/embeddings", {"model": "fixture-alias", "input": "x"})
         self.assertEqual(status, 501)
         self.assertEqual(body["error"]["type"], "unsupported_capability")
+
+
+class _FailingBackend:
+    """A backend whose generation always fails, without any native code."""
+
+    supports_cancel_check = True
+
+    def ready(self):
+        return True
+
+    def chat_completion(self, body, *, cancel_check=None):
+        raise BackendUnavailableError("fixture backend refused the request")
+
+
+class UnverifiedCompatibilityReportingTests(unittest.TestCase):
+    """Probe 10: a successful request never promotes a model to tested."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stack = build_gateway_stack(Path(self.tmp.name), alias="fixture-alias")
+        self.addCleanup(self.stack.stop)
+
+    def _chat(self):
+        return _post(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {"model": "fixture-alias", "messages": [{"role": "user", "content": "hello"}]},
+        )
+
+    def test_a_backend_defaults_to_unverified(self):
+        self.assertEqual(
+            self.stack.context.backends["fixture-alias"].compatibility_status, "unverified"
+        )
+
+    def test_status_still_reports_unverified_after_a_successful_request(self):
+        status, _body, _headers = self._chat()
+        self.assertEqual(status, 200)
+        _status, document, _headers = _get(self.stack.server.base_url, "/plag-in/v1/status")
+        self.assertEqual(document["model_compatibility"]["fixture-alias"], "unverified")
+        self.assertEqual(
+            document["service_class"]["fixture-alias"], "unverified_local_trial"
+        )
+        self.assertEqual(
+            document["runtime_profiles"]["fixture-alias"]["compatibility_status"], "unverified"
+        )
+
+    def test_capabilities_still_report_unverified_after_a_successful_request(self):
+        self._chat()
+        _status, document, _headers = _get(
+            self.stack.server.base_url, "/plag-in/v1/capabilities"
+        )
+        self.assertEqual(document["model_compatibility"]["fixture-alias"], "unverified")
+
+    def test_the_receipt_records_the_unverified_state_and_model_identity(self):
+        _status, _body, headers = self._chat()
+        _s, receipt, _h = _get(
+            self.stack.server.base_url,
+            f"/plag-in/v1/receipts/{headers.get('X-PLAG-IN-Receipt-ID')}",
+        )
+        record = receipt["plag_in_adapter_record"]
+        self.assertEqual(record["compatibility_status"], "unverified")
+        self.assertEqual(
+            record["effective_model_identity"]["weight_digest"], self.stack.identity.sha256
+        )
+        self.assertEqual(record["effective_model_identity"]["model_alias"], "fixture-alias")
+
+    def test_a_tested_backend_reports_tested_service(self):
+        current = self.stack.context.backends["fixture-alias"]
+        self.stack.context.backends["fixture-alias"] = replace(
+            current, compatibility_status="tested"
+        )
+        self._chat()
+        _status, document, _headers = _get(self.stack.server.base_url, "/plag-in/v1/status")
+        self.assertEqual(document["model_compatibility"]["fixture-alias"], "tested")
+        self.assertEqual(
+            document["service_class"]["fixture-alias"], "tested_profile_service"
+        )
+
+
+class FailedGenerationReceiptTests(unittest.TestCase):
+    """Probe 11: a failed request writes no completed receipt."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stack = build_gateway_stack(Path(self.tmp.name), alias="fixture-alias")
+        self.addCleanup(self.stack.stop)
+        current = self.stack.context.backends["fixture-alias"]
+        self.stack.context.backends["fixture-alias"] = replace(
+            current, inference_mode="embedded", inference_backend=_FailingBackend()
+        )
+
+    def _records(self) -> list[dict]:
+        text = self.stack.receipts_path.read_text(encoding="utf-8")
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+    def test_a_failed_generation_records_only_a_failed_receipt(self):
+        status, body, _headers = _post(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {"model": "fixture-alias", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["type"], "backend_unavailable")
+        records = self._records()
+        self.assertEqual([record["status"] for record in records], ["failed"])
+        self.assertNotIn("completed", {record["status"] for record in records})
+
+    def test_a_failed_responses_request_records_only_a_failed_receipt(self):
+        status, body, _headers = _post(
+            self.stack.server.base_url,
+            "/v1/responses",
+            {"model": "fixture-alias", "input": "hello"},
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"]["type"], "backend_unavailable")
+        self.assertEqual([record["status"] for record in self._records()], ["failed"])
+
+    def test_a_failed_generation_does_not_change_the_compatibility_state(self):
+        _post(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {"model": "fixture-alias", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        self.assertEqual(
+            self.stack.context.backends["fixture-alias"].compatibility_status, "unverified"
+        )
+
+
+class BufferedStreamFidelityTests(unittest.TestCase):
+    """Probe 13: buffered SSE preserves usage, tool calls, order and terminal."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stack = build_gateway_stack(
+            Path(self.tmp.name), alias="fixture-alias", with_tool_call=True
+        )
+        self.addCleanup(self.stack.stop)
+
+    def _events(self) -> list[dict]:
+        _status, raw, _headers = _post_stream(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {
+                "model": "fixture-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        self.assertTrue(raw.endswith(b"data: [DONE]\n\n"))
+        return [
+            json.loads(block[len("data: "):])
+            for block in raw.decode("utf-8").split("\n\n")
+            if block.startswith("data: ") and not block.endswith("[DONE]")
+        ]
+
+    def test_tool_call_fields_supplied_by_the_backend_survive_the_stream(self):
+        events = self._events()
+        self.assertIn("tool_calls", events[0]["choices"][0]["delta"])
+
+    def test_the_content_event_precedes_the_finish_event(self):
+        events = self._events()
+        self.assertIsNone(events[0]["choices"][0]["finish_reason"])
+        self.assertEqual(events[-1]["choices"][0]["delta"], {})
+        self.assertIsNotNone(events[-1]["choices"][0]["finish_reason"])
+
+    def test_usage_is_reported_on_the_non_streaming_response_it_came_from(self):
+        _status, body, _headers = _post(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {"model": "fixture-alias", "messages": [{"role": "user", "content": "hello"}]},
+        )
+        self.assertIn("usage", body)
+
+    def test_a_backend_error_is_typed_rather_than_streamed(self):
+        current = self.stack.context.backends["fixture-alias"]
+        self.stack.context.backends["fixture-alias"] = replace(
+            current, inference_mode="embedded", inference_backend=_FailingBackend()
+        )
+        status, body, headers = _post(
+            self.stack.server.base_url,
+            "/v1/chat/completions",
+            {
+                "model": "fixture-alias",
+                "messages": [{"role": "user", "content": "hello"}],
+                "stream": True,
+            },
+        )
+        self.assertEqual(status, 502)
+        self.assertEqual(headers.get_content_type(), "application/json")
+        self.assertEqual(body["error"]["type"], "backend_unavailable")
+
+
+class ResponsesCancellationTests(unittest.TestCase):
+    """Probe 15: a disconnect on either protocol reaches the same cancel path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.stack = build_gateway_stack(Path(self.tmp.name), alias="fixture-alias")
+        self.addCleanup(self.stack.stop)
+
+    def test_client_disconnect_cancels_a_responses_generation(self):
+        fixture = _CancellableEmbeddedFixture()
+        current = self.stack.context.backends["fixture-alias"]
+        self.stack.context.backends["fixture-alias"] = replace(
+            current, inference_mode="embedded", inference_backend=fixture
+        )
+        body = json.dumps({"model": "fixture-alias", "input": "disconnect fixture"}).encode(
+            "utf-8"
+        )
+        host, port_text = self.stack.server.base_url.removeprefix("http://").split(":")
+        client = socket.create_connection((host, int(port_text)), timeout=2)
+        client.sendall(
+            b"POST /v1/responses HTTP/1.1\r\n"
+            + f"Host: {host}:{port_text}\r\n".encode("ascii")
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        self.assertTrue(fixture.started.wait(1))
+        client.close()
+        self.assertTrue(fixture.cancelled.wait(2))
+
+    def test_the_admission_semaphore_is_released_after_a_cancellation(self):
+        fixture = _CancellableEmbeddedFixture()
+        current = self.stack.context.backends["fixture-alias"]
+        self.stack.context.backends["fixture-alias"] = replace(
+            current, inference_mode="embedded", inference_backend=fixture
+        )
+        body = json.dumps({"model": "fixture-alias", "input": "disconnect fixture"}).encode(
+            "utf-8"
+        )
+        host, port_text = self.stack.server.base_url.removeprefix("http://").split(":")
+        client = socket.create_connection((host, int(port_text)), timeout=2)
+        client.sendall(
+            b"POST /v1/responses HTTP/1.1\r\n"
+            + f"Host: {host}:{port_text}\r\n".encode("ascii")
+            + b"Content-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        self.assertTrue(fixture.started.wait(1))
+        client.close()
+        self.assertTrue(fixture.cancelled.wait(2))
+        # Every admission slot must be free again: acquiring the whole
+        # bounded set proves no permit was lost with the cancelled request.
+        # The handler thread is still unwinding when the fixture signals, so
+        # this waits for the release rather than racing it.
+        deadline = time.monotonic() + 2
+        acquired = []
+        try:
+            while len(acquired) < MAX_CONCURRENT_CHAT_REQUESTS:
+                if self.stack.context._inflight.acquire(blocking=False):
+                    acquired.append(True)
+                    continue
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+            self.assertEqual(len(acquired), MAX_CONCURRENT_CHAT_REQUESTS)
+        finally:
+            for _ in acquired:
+                self.stack.context._inflight.release()
 
 
 if __name__ == "__main__":
