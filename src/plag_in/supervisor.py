@@ -27,6 +27,7 @@ import contextlib
 import fcntl
 import json
 import os
+import secrets
 import signal
 import socket
 import subprocess
@@ -39,9 +40,16 @@ from pathlib import Path
 
 from plag_in.aliasing import validate_alias
 from plag_in.config import is_loopback
+from plag_in.confinement import (
+    ensure_state_dir,
+    open_state_file,
+    read_state_file,
+    unlink_if_ours,
+)
 from plag_in.errors import (
     AliasAlreadyRunningError,
     BackendUnavailableError,
+    ConfigurationError,
     ExecutableNotAllowedError,
     LocalityPolicyError,
     PathContainmentError,
@@ -49,6 +57,10 @@ from plag_in.errors import (
     ProcessIdentityError,
 )
 from plag_in.identity import canonical_digest, hash_file
+
+# A session record is a small flat object. The bound refuses a file that is not
+# one for what it is, rather than reading an unbounded amount into memory.
+_SESSION_RECORD_READ_LIMIT = 65536
 
 
 def _process_start_time_token(pid: int) -> str | None:
@@ -97,27 +109,40 @@ class SessionRecord:
 
 class Supervisor:
     def __init__(self, sessions_dir: Path):
-        self.sessions_dir = Path(sessions_dir).resolve()
-        self.sessions_dir.mkdir(parents=True, exist_ok=True)
+        # `resolve()` follows symbolic links, which is the indirection the
+        # state-file rules refuse rather than accept: a link at the sessions
+        # directory resolved to its target and every containment check below
+        # then held against the target instead of the declared directory.
+        # `abspath` normalises without following.
+        self.sessions_dir = Path(os.path.abspath(str(sessions_dir)))
+        ensure_state_dir(self.sessions_dir, "sessions directory", parents=True)
         self._processes: dict[str, subprocess.Popen] = {}
         self._processes_lock = threading.Lock()
 
     def _record_path(self, alias: str) -> Path:
         validate_alias(alias)
-        candidate = (self.sessions_dir / f"{alias}.json").resolve()
-        try:
-            candidate.relative_to(self.sessions_dir)
-        except ValueError as exc:
+        candidate = Path(os.path.abspath(str(self.sessions_dir / f"{alias}.json")))
+        if candidate.parent != self.sessions_dir:
             raise PathContainmentError(
                 "session record path escapes the sessions directory", alias=alias
-            ) from exc
+            )
         return candidate
 
     @contextlib.contextmanager
     def _alias_lock(self, alias: str):
-        """Serialise start/status/stop for one alias across threads and processes."""
+        """Serialise start/status/stop for one alias across threads and processes.
+
+        The lock was opened by name, so a link planted at `<alias>.alias_lock`
+        created a file wherever it pointed and a FIFO there held the open, and
+        with it every start, status and stop for that alias. This is the same
+        defect that was found and repaired at the receipt store's own lock
+        (independent review of work package A, second pass, D1).
+        """
+        validate_alias(alias)
         lock_path = self.sessions_dir / f"{alias}.alias_lock"
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fd = open_state_file(
+            lock_path, os.O_CREAT | os.O_RDWR, 0o600, "alias lock file"
+        )
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
@@ -126,27 +151,100 @@ class Supervisor:
             os.close(fd)
 
     def load_record(self, alias: str) -> SessionRecord | None:
+        """Return this alias's session record, or None when there is none.
+
+        Only a name nothing occupies is an absence. A link, a FIFO, a directory
+        or a file too large to be a record is a refusal, because reading one by
+        name is what the confined read exists to prevent.
+        """
         path = self._record_path(alias)
-        if not path.exists():
+        try:
+            raw = read_state_file(path, "session record", _SESSION_RECORD_READ_LIMIT)
+        except FileNotFoundError:
             return None
-        return SessionRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise ConfigurationError(
+                "the session record could not be read",
+                path=str(path),
+                alias=alias,
+                reason=str(exc),
+            ) from exc
+        if not isinstance(data, dict):
+            raise ConfigurationError(
+                "the session record is not an object", path=str(path), alias=alias
+            )
+        try:
+            return SessionRecord.from_dict(data)
+        except TypeError as exc:
+            raise ConfigurationError(
+                "the session record does not carry the recorded fields",
+                path=str(path),
+                alias=alias,
+                reason=str(exc),
+            ) from exc
 
     def _write_record(self, record: SessionRecord) -> None:
+        """Install a session record atomically, under a fresh temporary name.
+
+        The temporary name was `<alias>.json.tmp`, predictable and opened with
+        `O_TRUNC` and no `O_EXCL`, so a file already at that name was truncated
+        and its bytes replaced by this call's (the shape of R6-F3 in the receipt
+        store). A fresh unpredictable name created exclusively cannot be
+        occupied in advance, and the create is what proves the file is this
+        call's to remove.
+
+        Cleanup covers the temporary name only. Once `os.replace` commits, the
+        installed record is the coherent state and there is no outer transaction
+        to roll it back into, which is the distinction the receipt store had to
+        make between first construction and an established append (independent
+        review of the eighth pass, R8-F1). The removal is inode-bound, so a
+        committed replacement removes nothing.
+        """
         path = self._record_path(record.alias)
-        tmp_path = path.with_name(path.name + ".tmp")
-        fd = os.open(str(tmp_path), os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o600)
+        tmp_path = path.with_name(f"{path.name}.tmp.{secrets.token_hex(8)}")
+        created: list[tuple[Path, tuple[int, int]]] = []
+        fd = open_state_file(
+            tmp_path,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            0o600,
+            "session record temporary file",
+            created_registry=created,
+        )
         try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(json.dumps(record.as_dict(), sort_keys=True))
+            handle = os.fdopen(fd, "w", encoding="utf-8")
         except BaseException:
-            tmp_path.unlink(missing_ok=True)
+            os.close(fd)
+            self._remove_created(created)
             raise
-        os.replace(tmp_path, path)
+        try:
+            with handle:
+                os.fchmod(handle.fileno(), 0o600)
+                handle.write(json.dumps(record.as_dict(), sort_keys=True))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, path)
+        except BaseException:
+            self._remove_created(created)
+            raise
+
+    @staticmethod
+    def _remove_created(created: list[tuple[Path, tuple[int, int]]]) -> None:
+        """Remove what this call created, in reverse, and only while it is ours."""
+        for created_path, identity in reversed(created):
+            unlink_if_ours(created_path, identity)
 
     def _clear_record(self, alias: str) -> None:
+        # `unlink` removes the name, never what a link at that name points to,
+        # and an absent name is the state this asks for rather than an error.
+        # The `exists()` that preceded it followed a link and answered about
+        # the past.
         path = self._record_path(alias)
-        if path.exists():
-            path.unlink()
+        try:
+            os.unlink(str(path))
+        except FileNotFoundError:
+            pass
 
     def start(
         self,

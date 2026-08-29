@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from plag_in.errors import AliasAlreadyRunningError, PortConflictError, ReceiptChainError, ReceiptPersistenceError
+from plag_in.identity import RUNTIME_SOURCE_SCOPE
 from plag_in.receipts import Receipt, ReceiptStore
 from plag_in.supervisor import Supervisor
 
@@ -66,7 +67,9 @@ def _make_receipt(request_id: str, **overrides) -> Receipt:
         weight_digest="a" * 64, template_digest="b" * 64, config_digest="c" * 64,
         engine_executable_digest="d" * 64, argv_digest="e" * 64, locality_level="L1",
         route="local", listen_address="127.0.0.1:8080", backend_address="127.0.0.1:9000",
-        input_tokens=1, output_tokens=1, latency_ms=1.0, status="completed", content_retained=False,
+        input_tokens=1, output_tokens=1, latency_us=1, status="completed", content_retained=False,
+        schema_version="5", runtime_source_digest="a" * 64,
+        runtime_source_scope=RUNTIME_SOURCE_SCOPE,
     )
     base.update(overrides)
     return Receipt(**base)
@@ -579,8 +582,17 @@ class ForcedReceiptStoreConstructionFailureLeavesNothingTest(unittest.TestCase):
                      "gpu": None, "required_free_vram_mib": None},
                 ),
             ):
-                with self.assertRaises(OSError):
+                # Was `OSError`, which is what the raw `IsADirectoryError` from
+                # reading the key by name produced. The key is now opened with
+                # O_NOFOLLOW and checked with `fstat`, so a directory at that
+                # name is refused as a typed error before any read, per the
+                # rule in `errors.py` that a refusal surfaces through these
+                # types rather than a generic exception. What this test exists
+                # to establish, that the forced failure leaves no listener,
+                # engine or session, is unchanged and still asserted below.
+                with self.assertRaises(ReceiptPersistenceError) as raised:
                     cli_module.cmd_serve(args)
+            self.assertIn("not a regular file", str(raised.exception))
 
             sessions_dir = state_dir / "sessions"
             self.assertFalse(sessions_dir.exists() and any(sessions_dir.iterdir()))

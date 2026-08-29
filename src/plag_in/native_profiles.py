@@ -72,9 +72,16 @@ def identify_native_abi_profile(
     ggml_base_library_sha256: str,
     ggml_library_sha256: str,
     backend_library_sha256: tuple[str, ...],
-    profiles: tuple[NativeAbiProfile, ...] = REGISTERED_NATIVE_ABI_PROFILES,
+    profiles: tuple[NativeAbiProfile, ...] | None = None,
 ) -> NativeAbiProfile | None:
-    """Return the exact registered profile for one verified native bundle."""
+    """Return the exact registered profile for one verified native bundle.
+
+    The registry is read when the lookup runs rather than when this function
+    is defined, so the set of registered profiles has one live definition
+    and callers cannot hold a stale copy of it.
+    """
+    if profiles is None:
+        profiles = REGISTERED_NATIVE_ABI_PROFILES
     for profile in profiles:
         if profile.matches(
             upstream_identity=upstream_identity,

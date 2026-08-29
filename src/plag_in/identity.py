@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -10,12 +12,40 @@ from plag_in.errors import ConfigurationError, PathContainmentError
 
 _CHUNK_SIZE = 1024 * 1024
 
+# One exact manifest-digest syntax, shared by every path that reads a
+# declared digest: inventory, quick summary and manifest-bound resolution.
+# A prefix test accepts `sha256:abc`, whose derived `blobs/sha256-abc`
+# filename can exist on disk, so a manifest that cannot bind a complete
+# SHA-256 identity was reported as complete local availability
+# (independent review of general model admission, F2).
+_MANIFEST_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+
 # Scope label bound into every runtime source digest so the value can never
 # be read as a whole-repository or release-archive digest. It covers only
 # the runtime Python source that actually executes an inference request,
 # and deliberately excludes tests, reports, configuration, receipts, model
 # bytes and generated caches (none of which live under this package tree).
 RUNTIME_SOURCE_SCOPE = "runtime_python_source:src/plag_in/**/*.py"
+
+
+def is_manifest_digest(value) -> bool:
+    """True only for `sha256:` followed by exactly 64 lowercase hex characters."""
+    return isinstance(value, str) and _MANIFEST_DIGEST_RE.fullmatch(value) is not None
+
+
+def manifest_digest_hex(digest: str) -> str:
+    """The 64-character hex body of a digest already accepted by `is_manifest_digest`."""
+    if not is_manifest_digest(digest):
+        raise ConfigurationError(
+            "manifest digest must be 'sha256:' followed by 64 lowercase hexadecimal characters",
+            declared_digest=str(digest),
+        )
+    return digest.split(":", 1)[1]
+
+
+def blob_filename(digest: str) -> str:
+    """The Ollama blob filename bound to one exact manifest digest."""
+    return f"sha256-{manifest_digest_hex(digest)}"
 
 
 def hash_file(path: Path) -> str:
@@ -31,9 +61,31 @@ def hash_file(path: Path) -> str:
 
 
 def canonical_digest(record: dict) -> str:
-    """Deterministic digest of a JSON-serialisable record, key order independent."""
-    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    """Deterministic digest of a JSON-serialisable record, key order independent.
+
+    Canonical form is pinned so a non-Python implementation produces identical
+    bytes: UTF-8, keys sorted, no insignificant whitespace, and non-ASCII emitted
+    raw rather than \\uXXXX-escaped. Records must not contain floats; float
+    formatting is not portable across languages.
+    """
+    return hashlib.sha256(canonical_bytes(record)).hexdigest()
+
+
+def canonical_bytes(record: dict) -> bytes:
+    """Canonical UTF-8 serialisation of a record: the exact bytes to store or hash.
+
+    Keys sorted by code point, no insignificant whitespace, non-ASCII emitted
+    raw. A caller writing these bytes to a store and a caller digesting them
+    must not diverge, so both go through this function.
+    """
+    return json.dumps(
+        record, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+
+
+def canonical_line(record: dict) -> bytes:
+    """One canonical store line: canonical bytes plus a single LF terminator."""
+    return canonical_bytes(record) + b"\n"
 
 
 @dataclass(frozen=True)
@@ -82,25 +134,62 @@ def compute_source_tree_digest(root: Path) -> dict:
     """
     resolved_root = Path(root).resolve()
     manifest: list[dict] = []
-    for path in sorted(resolved_root.rglob("*.py")):
-        if "__pycache__" in path.parts:
-            continue
-        if path.is_symlink():
-            raise PathContainmentError(
-                "refusing to hash a symlinked runtime source file",
-                requested_path=str(path),
-            )
-        if not path.is_file():
-            continue
-        resolved_file = path.resolve()
-        try:
-            relative = resolved_file.relative_to(resolved_root)
-        except ValueError as exc:
-            raise PathContainmentError(
-                "runtime source file resolves outside the package root",
-                requested_path=str(resolved_file),
-            ) from exc
-        manifest.append({"path": relative.as_posix(), "sha256": hash_file(resolved_file)})
+
+    def _raise_walk_error(exc: OSError) -> None:
+        raise ConfigurationError(
+            "failed to enumerate the runtime source tree",
+            root=str(resolved_root),
+            reason=str(exc),
+        ) from exc
+
+    for directory, dirnames, filenames in os.walk(
+        resolved_root,
+        topdown=True,
+        onerror=_raise_walk_error,
+        followlinks=False,
+    ):
+        directory_path = Path(directory)
+        traversable_dirs: list[str] = []
+        for name in sorted(dirnames):
+            if name == "__pycache__":
+                continue
+            candidate = directory_path / name
+            if candidate.is_symlink():
+                raise PathContainmentError(
+                    "refusing to hash a symlinked runtime source directory",
+                    requested_path=str(candidate),
+                )
+            resolved_directory = candidate.resolve()
+            try:
+                resolved_directory.relative_to(resolved_root)
+            except ValueError as exc:
+                raise PathContainmentError(
+                    "runtime source directory resolves outside the package root",
+                    requested_path=str(resolved_directory),
+                ) from exc
+            traversable_dirs.append(name)
+        dirnames[:] = traversable_dirs
+
+        for name in sorted(filenames):
+            if not name.endswith(".py"):
+                continue
+            path = directory_path / name
+            if path.is_symlink():
+                raise PathContainmentError(
+                    "refusing to hash a symlinked runtime source file",
+                    requested_path=str(path),
+                )
+            if not path.is_file():
+                continue
+            resolved_file = path.resolve()
+            try:
+                relative = resolved_file.relative_to(resolved_root)
+            except ValueError as exc:
+                raise PathContainmentError(
+                    "runtime source file resolves outside the package root",
+                    requested_path=str(resolved_file),
+                ) from exc
+            manifest.append({"path": relative.as_posix(), "sha256": hash_file(resolved_file)})
     if not manifest:
         raise ConfigurationError(
             "runtime source tree is empty; refusing to bind an empty source identity",

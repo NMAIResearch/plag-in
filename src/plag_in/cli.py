@@ -9,8 +9,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -20,7 +22,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TextIO
 
-from plag_in.config import is_loopback, load_config_file
+from plag_in.active_store import ActiveReceiptStore
+from plag_in.compatibility_records import find_compatibility_record
+from plag_in.config import is_loopback, load_config_file, with_trial_profile
+from plag_in.conformance import check_conformance
 from plag_in.connect import emit
 from plag_in.engines.base import EngineAdapter
 from plag_in.engines.libllama import EmbeddedLibLlama, LibLlamaAdapter
@@ -34,19 +39,42 @@ from plag_in.errors import (
     PlagInError,
 )
 from plag_in.gateway import BackendInfo, GatewayContext, GatewayServer
+from plag_in.gguf_metadata import UNASSESSED, read_gguf_metadata
 from plag_in.identity import canonical_digest
-from plag_in.input_control import confirm_action, select_number
-from plag_in.inventory import discover_gguf, discover_ollama_models
-from plag_in.model_paths import resolve_contained_model
+from plag_in.input_control import (
+    confirm_action,
+    select_menu,
+    select_number,
+    terminal_menu_available,
+)
+from plag_in.inventory import (
+    AVAILABILITY_LOCAL_COMPLETE,
+    HeldModel,
+    discover_gguf,
+    discover_held_models,
+    discover_ollama_models,
+)
+from plag_in.model_paths import (
+    resolve_contained_model,
+    verify_model_unchanged,
+    witness_model_file,
+)
 from plag_in.onboarding import doctor_report, render_doctor, run_setup_assistant
 from plag_in.paths import StateLayout
-from plag_in.receipts import ReceiptStore
+from plag_in.receipts import (
+    CURRENT_STORE_FILENAME,
+    RECEIPT_SCHEMA_VERSION,
+    ReceiptStore,
+    initialise_current_store,
+    rollback_current_store,
+)
 from plag_in.recommend import RecommendationQuery, load_catalogue, recommend as recommend_fn
 from plag_in.registry import Registry, RegistryEntry
 from plag_in.resource_safety import (
     CHAT_MEMORY_HIGH_BYTES,
     CHAT_MEMORY_MAX_BYTES,
     CHAT_SWAP_MAX_BYTES,
+    evaluate_model_admission,
     resource_preflight,
     verify_chat_cgroup,
 )
@@ -54,6 +82,7 @@ from plag_in.setup_flow import (
     configure_tested_model,
     default_config_path,
     default_state_path,
+    detect_tested_candidate,
 )
 from plag_in.supervisor import Supervisor
 
@@ -64,6 +93,303 @@ ENGINE_ADAPTERS: dict[str, EngineAdapter] = {
 
 _MEMORY_OVERHEAD_FACTOR = 1.2  # rough runtime overhead multiplier; always labelled an estimate
 _BOUNDED_CHAT_ENV = "PLAG_IN_BOUNDED_CHAT"
+_TRIAL_ALIAS_PREFIX = "trial-"
+_UNSAFE_ALIAS_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
+
+# What the private test chat tells the model about itself, built only from
+# values verified on this computer. It is scoped to the private test-chat
+# conversation and never enters a request from another harness. It carries
+# no provider name: naming one would state an origin PLAG IN has not
+# verified from the model's own local metadata.
+_IDENTITY_INSTRUCTION_TEMPLATE = (
+    "You are being run locally by PLAG IN under the local alias {alias}. "
+    "The local model file has SHA-256 {sha256}. Its GGUF metadata declares "
+    "architecture {architecture} and context length {context_length}. "
+    "If you are asked which model you are, report exactly this local identity. "
+    "Do not claim a different model, product or provider identity."
+)
+
+
+def _trial_alias_for(tag: str) -> str:
+    """Derive a valid alias from a local tag without inventing identity."""
+    cleaned = _UNSAFE_ALIAS_CHARS.sub("-", tag).strip("-") or "model"
+    return (_TRIAL_ALIAS_PREFIX + cleaned)[:64]
+
+
+@dataclass(frozen=True)
+class _InventoryRow:
+    """One selectable line of the held-model inventory."""
+
+    label: str
+    startable: bool
+    reason: str
+    compatibility_status: str
+    alias: str | None = None
+    profile: object | None = None
+    entry: HeldModel | None = None
+
+
+def _held_size_text(size_bytes: int | None) -> str:
+    if size_bytes is None:
+        return "size unassessed"
+    return f"{size_bytes / (1024**3):.2f} GiB"
+
+
+def _inventory_rows(config, manifest_root: Path | None) -> list[_InventoryRow]:
+    """Build the full held inventory with configured profiles first.
+
+    Sizes and availability for held entries come from manifests and file
+    lengths, so listing them hashes no weight file. A profile whose stored
+    label is `tested` is the one exception: the menu offers it as a tested
+    start, so the bytes behind that offer are resolved and hashed here and
+    the state shown comes from that derivation, never from the stored label
+    (independent review of the general model admission repair, F1-R1). A
+    profile whose bytes are absent or uncontained stays on the list carrying
+    the reason it cannot be started. Nothing is dropped.
+    """
+    rows: list[_InventoryRow] = []
+    configured_paths: dict[str, tuple[str, object]] = {
+        str(profile.model_path): (alias, profile) for alias, profile in config.profiles.items()
+    }
+
+    for alias, profile in sorted(config.profiles.items()):
+        if profile.compatibility_status != "tested":
+            continue
+        try:
+            identity = resolve_contained_model(
+                profile.model_path, list(config.model_roots), config.ollama_manifest_root
+            )
+        except PlagInError as exc:
+            rows.append(
+                _InventoryRow(
+                    label=(
+                        f"{profile.display_name} ({alias}) | configured profile | "
+                        f"not startable: {exc.error_type}"
+                    ),
+                    startable=False,
+                    reason=exc.error_type,
+                    compatibility_status="unverified",
+                    alias=alias,
+                    profile=profile,
+                )
+            )
+            continue
+        status, disclosure = derive_compatibility_state(profile, identity)
+        rows.append(
+            _InventoryRow(
+                label=(
+                    f"{profile.display_name} ({alias}) | configured profile | "
+                    f"available: local_complete | compatibility: "
+                    f"{_compatibility_text(status, disclosure)}"
+                ),
+                startable=True,
+                reason=disclosure.get("reason", ""),
+                compatibility_status=status,
+                alias=alias,
+                profile=profile,
+            )
+        )
+
+    held = discover_held_models(manifest_root, list(config.model_roots))
+    complete, incomplete = [], []
+    for entry in held:
+        if entry.blob_path and entry.blob_path in configured_paths:
+            alias, profile = configured_paths[entry.blob_path]
+            if profile.compatibility_status == "tested":
+                continue
+        (complete if entry.availability == AVAILABILITY_LOCAL_COMPLETE else incomplete).append(entry)
+
+    for entry in complete:
+        rows.append(
+            _InventoryRow(
+                label=(
+                    f"{entry.tag} | {_held_size_text(entry.held_size_bytes)} | "
+                    f"available: {entry.availability} | compatibility: unverified"
+                ),
+                startable=True,
+                reason="",
+                compatibility_status="unverified",
+                alias=_trial_alias_for(entry.tag),
+                entry=entry,
+            )
+        )
+    for entry in incomplete:
+        rows.append(
+            _InventoryRow(
+                label=(
+                    f"{entry.tag} | {_held_size_text(entry.held_size_bytes)} | "
+                    f"available: {entry.availability} | not startable: {entry.reason}"
+                ),
+                startable=False,
+                reason=entry.reason,
+                compatibility_status="unverified",
+                entry=entry,
+            )
+        )
+    return rows
+
+
+def _select_inventory_row(
+    rows: list[_InventoryRow],
+    input_fn: Callable[[str], str],
+    output: TextIO,
+    heading: str,
+) -> _InventoryRow | None:
+    """Select one inventory line with Up, Down, Enter and q."""
+    if not rows:
+        return None
+    labels = [row.label for row in rows]
+    print(heading, file=output)
+    if terminal_menu_available(input_fn, output):
+        selection = select_menu(
+            labels,
+            output,
+            "Use Up and Down, then press Enter. Press q to return.",
+        )
+    else:
+        for index, label in enumerate(labels, 1):
+            print(f"  {index}. {label}", file=output)
+        selection = select_number(
+            input_fn, output, f"Select 1-{len(labels)}: ", minimum=1, maximum=len(labels)
+        )
+    if selection is None:
+        return None
+    return rows[selection - 1]
+
+
+def _manifest_root_for(config) -> Path | None:
+    if config.ollama_manifest_root is not None:
+        return config.ollama_manifest_root
+    default_root = Path.home() / ".ollama" / "models"
+    return default_root if default_root.is_dir() else None
+
+
+def _resolve_trial_entry(config, trial_model: str) -> HeldModel:
+    """Find one held entry by tag or by held path, without starting anything."""
+    held = discover_held_models(_manifest_root_for(config), list(config.model_roots))
+    for entry in held:
+        if trial_model in (entry.tag, entry.blob_path):
+            return entry
+    raise ConfigurationError(
+        "the requested trial model is not present in the local inventory",
+        trial_model=trial_model,
+    )
+
+
+def _assess_trial_admission(config, entry: HeldModel, engine_name: str) -> dict:
+    """Decide whether one held model may receive a bounded unverified trial.
+
+    Availability, static compatibility and host resources are assessed as
+    separate axes and each refusal keeps its own reason, so an absent blob
+    is never reported as an unsupported model and a resource refusal is
+    never reported as an incompatible one (D-021).
+    """
+    record: dict = {
+        "tag": entry.tag,
+        "source": entry.source,
+        "availability": entry.availability,
+        "compatibility": "unverified",
+        "admission": "refused",
+        "reason": entry.reason,
+        "identity": None,
+        "metadata": None,
+        "resources": None,
+        "requested_runtime": config.runtime.as_dict(),
+    }
+    if entry.availability != AVAILABILITY_LOCAL_COMPLETE:
+        record["reason"] = entry.reason or "model bytes are not held on this computer"
+        return record
+
+    try:
+        identity = resolve_contained_model(
+            Path(entry.blob_path), list(config.model_roots), config.ollama_manifest_root
+        )
+    except (PathContainmentError, ModelIdentityMismatchError) as exc:
+        record["reason"] = exc.error_type
+        record["detail"] = exc.message
+        return record
+    record["identity"] = {
+        "path": identity.path,
+        "sha256": identity.sha256,
+        "size_bytes": identity.size_bytes,
+    }
+
+    try:
+        metadata = read_gguf_metadata(identity.path)
+    except ConfigurationError as exc:
+        record["compatibility"] = "unsupported"
+        record["reason"] = exc.fields.get("reason", "gguf_inspection_failed")
+        record["detail"] = exc.message
+        return record
+    record["metadata"] = metadata.as_dict()
+    if not metadata.chat_template_present:
+        # A chat request needs a chat template. Without one the embedded
+        # engine has nothing to apply, and this is a property of the file,
+        # not of the host.
+        record["compatibility"] = "unsupported"
+        record["reason"] = "gguf_declares_no_chat_template"
+        return record
+
+    resources = evaluate_model_admission(identity.size_bytes, config.runtime.gpu_layers)
+    record["resources"] = resources
+    if resources["outcome"] != "admitted":
+        record["reason"] = resources["outcome"]
+        return record
+
+    record["admission"] = "approved"
+    record["reason"] = ""
+    record["engine"] = engine_name
+    return record
+
+
+def _print_trial_disclosure(record: dict, alias: str, output: TextIO) -> None:
+    """Show every value the operator is being asked to confirm."""
+    metadata = record["metadata"]
+    identity = record["identity"]
+    resources = record["resources"]
+    preflight = resources["preflight"]
+    unassessed = ", ".join(metadata["unassessed_fields"]) or "none"
+    print(
+        f"\nUnverified local model trial\n"
+        f"  Local tag: {record['tag']}\n"
+        f"  Trial alias: {alias}\n"
+        f"  Model path: {identity['path']}\n"
+        f"  Complete SHA-256: {identity['sha256']}\n"
+        f"  Held size: {_held_size_text(identity['size_bytes'])}\n"
+        f"  GGUF version: {metadata['gguf_version']}\n"
+        f"  Architecture: {metadata['architecture']}\n"
+        f"  Declared context length: {metadata['context_length']}\n"
+        f"  Chat template present: {str(metadata['chat_template_present']).lower()}\n"
+        f"  Quantisation identifier: {metadata['file_type_id']} "
+        f"(label: {metadata['file_type_label']})\n"
+        f"  Unassessed metadata: {unassessed}\n"
+        f"  Requested runtime: {json.dumps(record['requested_runtime'], sort_keys=True)}\n"
+        f"  Cgroup memory maximum: {resources['cgroup']['memory.max'] // (1024**2)} MiB\n"
+        f"  Available RAM: {preflight['available_ram_bytes'] // (1024**2)} MiB\n"
+        f"  Required available RAM: "
+        f"{preflight['required_available_ram_bytes'] // (1024**2)} MiB\n"
+        f"  Resource policy: {resources['policy_validation_status']}\n"
+        "  This is an unverified local trial. It does not promote this model to tested,\n"
+        "  and it writes no persistent configuration.",
+        file=output,
+    )
+    if preflight["gpu"] is not None:
+        print(
+            f"  Free VRAM: {preflight['gpu']['free_mib']} MiB\n"
+            f"  Required free VRAM: {preflight['required_free_vram_mib']} MiB",
+            file=output,
+        )
+
+
+def _identity_instruction(alias: str, record: dict) -> str:
+    """Build the private test-chat identity instruction from verified metadata."""
+    metadata = record["metadata"] or {}
+    return _IDENTITY_INSTRUCTION_TEMPLATE.format(
+        alias=alias,
+        sha256=(record["identity"] or {}).get("sha256", UNASSESSED),
+        architecture=metadata.get("architecture", UNASSESSED),
+        context_length=metadata.get("context_length", UNASSESSED),
+    )
 
 
 def _memory_estimate_gb(size_bytes: int) -> float:
@@ -81,6 +407,112 @@ def _runtime_profile_summary(config, identity, engine_name: str) -> dict:
         "runtime": config.runtime.as_dict(),
         "sampling_note": "temperature and top_p are server fallbacks; explicit client request values take precedence",
     }
+
+
+def derive_compatibility_state(profile, identity) -> tuple[str, dict]:
+    """The one derivation of compatibility from resolved model bytes.
+
+    Every route that has resolved a model calls this and carries what it
+    returns. No surface downstream of resolution reads
+    `profile.compatibility_status`: the configuration label selects a
+    candidate, and the bytes decide what is reported, registered and
+    recorded (independent review of the general model admission repair,
+    F1-R1). A profile whose stored label is `tested` but whose bytes are not
+    the recorded bytes is reported `unverified` with both digests, and a
+    record withdrawn from the reviewed source demotes the profile rather
+    than letting a stored label outlive its evidence.
+    """
+    def _evidence(status: str, reason: str, record_id, recorded, **extra) -> dict:
+        # One shape on every outcome. A surface that reports compatibility
+        # reports what was compared, so a reader never has to infer whether
+        # a digest is absent because it matched or because no record exists
+        # (independent review of repair 2, F1-R3).
+        return {
+            "status": status,
+            "reason": reason,
+            "compatibility_record": record_id,
+            "recorded_model_sha256": recorded,
+            "observed_model_sha256": identity.sha256,
+            **extra,
+        }
+
+    if profile is None:
+        return "unverified", _evidence(
+            "unverified",
+            "no_configured_profile_for_this_model_path_and_engine",
+            None,
+            None,
+        )
+    if profile.compatibility_status != "tested":
+        return "unverified", _evidence(
+            "unverified", "configured_profile_is_not_tested", None, None
+        )
+
+    record = (
+        find_compatibility_record(profile.compatibility_record)
+        if profile.compatibility_record
+        else None
+    )
+    if record is None:
+        return "unverified", _evidence(
+            "unverified",
+            "reviewed_compatibility_record_absent",
+            profile.compatibility_record,
+            None,
+        )
+    if identity.sha256 != record.model_sha256:
+        return "unverified", _evidence(
+            "unverified",
+            "model_digest_does_not_match_reviewed_record",
+            record.record_id,
+            record.model_sha256,
+        )
+    return "tested", _evidence(
+        "tested",
+        "",
+        record.record_id,
+        record.model_sha256,
+        decision_id=record.decision_id,
+        trial_report=record.trial_report,
+        trial_report_sha256=record.trial_report_sha256,
+        native_abi_profile_id=record.native_abi_profile_id,
+        record_binding_digest=record.binding_digest(),
+    )
+
+
+def _compatibility_text(status: str, disclosure: dict) -> str:
+    """The compatibility line an operator reads before confirming a load."""
+    if disclosure.get("reason"):
+        return f"{status} ({disclosure['reason']})"
+    return status
+
+
+def _compatibility_disclosure_lines(disclosure: dict) -> str:
+    """The digests a compatibility claim rests on, for operator output."""
+    recorded = disclosure.get("recorded_model_sha256") or "none recorded"
+    return (
+        f"  Compatibility record: {disclosure.get('compatibility_record') or 'none'}\n"
+        f"  Recorded model SHA-256: {recorded}\n"
+        f"  Observed model SHA-256: {disclosure.get('observed_model_sha256')}\n"
+    )
+
+
+def _serve_compatibility_state(config, identity, engine_name: str) -> tuple[str, dict]:
+    """Derive the state for a model path handed straight to `serve`.
+
+    Serving a path directly is `unverified` unless that exact path and
+    engine are a configured profile, and a request that succeeds never
+    promotes it (D-021).
+    """
+    profile = next(
+        (
+            candidate
+            for candidate in config.profiles.values()
+            if str(candidate.model_path) == identity.path and candidate.engine == engine_name
+        ),
+        None,
+    )
+    return derive_compatibility_state(profile, identity)
 
 
 def _runtime_receipt_profile(config, engine_name: str) -> dict:
@@ -109,20 +541,42 @@ class _EmbeddedSession:
     server: GatewayServer
     embedded: EmbeddedLibLlama
     context: GatewayContext
-    receipts: ReceiptStore
+    receipts: ActiveReceiptStore
 
     def close(self) -> None:
         self.server.stop()
         self.embedded.close()
 
 
-def _start_embedded_session(config, alias: str, profile, state_dir: Path) -> _EmbeddedSession:
+def _start_embedded_session(
+    config,
+    alias: str,
+    profile,
+    state_dir: Path,
+    *,
+    identity=None,
+) -> _EmbeddedSession:
+    """Start one embedded session for an already-selected profile.
+
+    The registration sink derives its own compatibility state from the
+    profile and the identity it is about to register. There is deliberately
+    no parameter for that state: a sink that accepted one could be handed a
+    value conflicting with its own resolved identity, which would recreate
+    the asserted-`tested` defect one layer inside the product rather than in
+    configuration (independent review of repair 2, F1-R2).
+
+    A caller that has already resolved the model passes the identity it
+    resolved, so the weights are read once. Re-deriving from an identity in
+    hand reads nothing further.
+    """
     engine_cfg = config.engines[profile.engine]
     if engine_cfg.kind != "embedded":
         raise ConfigurationError("private test chat requires an embedded engine")
-    identity = resolve_contained_model(
-        profile.model_path, list(config.model_roots), config.ollama_manifest_root
-    )
+    if identity is None:
+        identity = resolve_contained_model(
+            profile.model_path, list(config.model_roots), config.ollama_manifest_root
+        )
+    compatibility, compatibility_evidence = derive_compatibility_state(profile, identity)
     registry = Registry()
     config_digest = canonical_digest(
         {
@@ -142,7 +596,11 @@ def _start_embedded_session(config, alias: str, profile, state_dir: Path) -> _Em
     registry.verify_identity(alias)
 
     state = StateLayout(state_dir).ensure()
-    receipts = ReceiptStore(state.receipts_file, hmac_key_path=state.receipts_hmac_key_file)
+    # New receipts go to whichever store is active at the moment of the write:
+    # the original store until a current-schema store has been initialised
+    # beside it, that store from activation onwards. Resolving once here bound
+    # a running session to the store it started with (second pass, D2).
+    receipts = ActiveReceiptStore(state)
     context = GatewayContext(config, registry, receipts, ENGINE_ADAPTERS)
     server = GatewayServer(context)
     embedded = EmbeddedLibLlama(
@@ -181,6 +639,8 @@ def _start_embedded_session(config, alias: str, profile, state_dir: Path) -> _Em
                 gpu_offload=runtime_profile.get("gpu_offload"),
                 runtime_profile=runtime_profile,
                 inference_backend=embedded,
+                compatibility_status=compatibility,
+                compatibility_evidence=compatibility_evidence,
             ),
         )
         server.start()
@@ -205,21 +665,142 @@ def _select_tested_profile(config, input_fn: Callable[[str], str], output: TextI
               if profile.compatibility_status == "tested"]
     if not tested:
         raise ConfigurationError("configuration contains no compatibility-tested model profile")
-    if len(tested) == 1:
+    if len(tested) == 1 and not terminal_menu_available(input_fn, output):
         return tested[0]
-    print("Tested local profiles", file=output)
-    for index, (_, profile) in enumerate(tested, 1):
-        print(f"  {index}. {profile.display_name}", file=output)
-    selection = select_number(
-        input_fn,
-        output,
-        f"Select 1-{len(tested)}: ",
-        minimum=1,
-        maximum=len(tested),
-    )
+    labels = [f"{profile.display_name} ({alias})" for alias, profile in tested]
+    if terminal_menu_available(input_fn, output):
+        selection = select_menu(
+            labels,
+            output,
+            "Tested local profiles. Use Up and Down, then press Enter.",
+        )
+    else:
+        print("Tested local profiles", file=output)
+        for index, label in enumerate(labels, 1):
+            print(f"  {index}. {label}", file=output)
+        selection = select_number(
+            input_fn,
+            output,
+            f"Select 1-{len(tested)}: ",
+            minimum=1,
+            maximum=len(tested),
+        )
     if selection is None:
         raise ConfigurationError("tested profile selection was cancelled; no model was started")
     return tested[selection - 1]
+
+
+def _legacy_receipt_store_requires_current(state: StateLayout) -> bool:
+    """Return whether the original store contains a pre-current record."""
+    snapshot = state.active_store_snapshot()
+    if not snapshot.is_legacy:
+        return False
+    try:
+        info = os.lstat(snapshot.store)
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ConfigurationError(
+            "the legacy receipt store could not be inspected",
+            path=str(snapshot.store),
+            reason=str(exc),
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise ConfigurationError(
+            "the legacy receipt store is not a regular file",
+            path=str(snapshot.store),
+        )
+    if info.st_size == 0:
+        return False
+    try:
+        fd = os.open(str(snapshot.store), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        raise ConfigurationError(
+            "the legacy receipt store could not be opened",
+            path=str(snapshot.store),
+            reason=str(exc),
+        ) from exc
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ConfigurationError(
+                "the legacy receipt store is not a regular file",
+                path=str(snapshot.store),
+            )
+        with os.fdopen(fd, "rb") as handle:
+            fd = -1
+            for raw in handle:
+                try:
+                    record = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    return True
+                if not isinstance(record, dict):
+                    return True
+                if record.get("schema_version") != RECEIPT_SCHEMA_VERSION:
+                    return True
+    finally:
+        if fd >= 0:
+            os.close(fd)
+    return False
+
+
+def _initialise_receipt_state(state: StateLayout, destination: Path | None = None) -> dict:
+    destination = destination or state.base / CURRENT_STORE_FILENAME
+    destination = state.validate_active_store_path(destination)
+    created = initialise_current_store(destination)
+    try:
+        pointer = state.write_receipt_pointer(destination, created["schema_version"])
+    except BaseException:
+        rollback_current_store(created)
+        raise
+    created.pop("created_identities", None)
+    return {
+        "initialised": created,
+        "active_pointer": pointer,
+        "receipt_stores": state.receipt_store_roles(),
+        "legacy_store_modified": False,
+    }
+
+
+def _prepare_receipt_state(
+    state_dir: Path,
+    input_fn: Callable[[str], str],
+    output: TextIO,
+) -> bool:
+    """Activate a separate current store before loading a model when required."""
+    state = StateLayout(state_dir)
+    if not _legacy_receipt_store_requires_current(state):
+        return True
+    destination = state.base / CURRENT_STORE_FILENAME
+    affected = (
+        destination,
+        destination.with_name(destination.name + ".hmac_key"),
+        destination.with_name(destination.name + ".checkpoint"),
+        destination.with_name(destination.name + ".lock"),
+        state.base / "receipts.init.lock",
+        state.receipt_pointer_file,
+    )
+    print(
+        "Receipt migration required before inference.\n"
+        f"  Historical store preserved: {state.legacy_receipts_file}\n"
+        "  New current-schema state:\n"
+        + "\n".join(f"    {path}" for path in affected),
+        file=output,
+    )
+    if not confirm_action(
+        input_fn,
+        output,
+        "Create and activate the separate current-schema receipt store? [y/N] ",
+    ):
+        print("No listener or model was started.", file=output)
+        return False
+    result = _initialise_receipt_state(state)
+    print(
+        f"Current-schema receipt store active: {result['active_pointer']['current_store']}\n"
+        "Historical receipt bytes were not modified.",
+        file=output,
+    )
+    return True
 
 
 def _model_load_safety(identity, gpu_layers: str) -> tuple[dict, dict]:
@@ -262,6 +843,59 @@ def _local_chat_request(base_url: str, api_key: str | None, alias: str,
     return {"content": content, "payload": payload}
 
 
+def _prepare_trial(
+    config,
+    trial_model: str,
+    trial_alias: str | None,
+    input_fn: Callable[[str], str],
+    output: TextIO,
+):
+    """Admit or refuse one unverified held model, without persisting anything.
+
+    Returns `(config, alias, profile, record)` on approval. A refusal
+    returns `None` after printing the measured reason, and starts nothing.
+    """
+    entry = _resolve_trial_entry(config, trial_model)
+    engine_name = next(
+        (name for name, engine in config.engines.items() if engine.kind == "embedded"), None
+    )
+    if engine_name is None:
+        raise ConfigurationError("an unverified local trial requires a configured embedded engine")
+
+    record = _assess_trial_admission(config, entry, engine_name)
+    if record["admission"] != "approved":
+        print(
+            f"\nUnverified local model trial refused\n"
+            f"  Local tag: {record['tag']}\n"
+            f"  Availability: {record['availability']}\n"
+            f"  Compatibility: {record['compatibility']}\n"
+            f"  Reason: {record['reason']}\n"
+            f"  Detail: {record.get('detail', 'none')}\n"
+            f"  Measurements: {json.dumps(record['resources'], sort_keys=True)}\n"
+            "  No listener, engine or model was started.",
+            file=output,
+        )
+        return None
+
+    alias = trial_alias or _trial_alias_for(entry.tag)
+    trial_config = with_trial_profile(
+        config,
+        alias,
+        Path(record["identity"]["path"]),
+        engine_name,
+        entry.tag,
+    )
+    _print_trial_disclosure(record, alias, output)
+    if not confirm_action(
+        input_fn,
+        output,
+        "Load this unverified local model for a bounded trial? [y/N] ",
+    ):
+        print("No listener or model was started.", file=output)
+        return None
+    return trial_config, alias, trial_config.profiles[alias], record
+
+
 def run_private_chat(
     config_path: Path,
     input_fn: Callable[[str], str],
@@ -269,20 +903,38 @@ def run_private_chat(
     *,
     state_dir: Path | None = None,
     max_tokens: int = 256,
+    trial_model: str | None = None,
+    trial_alias: str | None = None,
 ) -> int:
     """Start one confirmed embedded model and stop it when the chat closes."""
     config = load_config_file(config_path)
-    alias, profile = _select_tested_profile(config, input_fn, output)
+    trial_record = None
+    if trial_model is not None:
+        prepared = _prepare_trial(config, trial_model, trial_alias, input_fn, output)
+        if prepared is None:
+            return 0
+        config, alias, profile, trial_record = prepared
+    else:
+        alias, profile = _select_tested_profile(config, input_fn, output)
     identity = resolve_contained_model(
         profile.model_path, list(config.model_roots), config.ollama_manifest_root
     )
+    witness = witness_model_file(identity.path)
+    compatibility, compatibility_disclosure = derive_compatibility_state(profile, identity)
     cgroup, safety = _model_load_safety(identity, config.runtime.gpu_layers)
     summary = _runtime_profile_summary(config, identity, profile.engine)
-    effective_state = (state_dir or default_state_path()).resolve()
+    # Never resolved. `Path.resolve()` follows every symbolic link in the
+    # path, so the confined walk received the link's target and had nothing
+    # left to refuse: a state path declared through a link was silently
+    # replaced by whatever it named (independent review of the C1 repair,
+    # C1-R1). A path the operator declares is used exactly as declared.
+    effective_state = Path(state_dir) if state_dir is not None else default_state_path()
     print(
         f"\nPrivate test chat\n"
         f"  Model: {profile.display_name}\n"
         f"  Alias: {alias}\n"
+        f"  Compatibility: {_compatibility_text(compatibility, compatibility_disclosure)}\n"
+        f"{_compatibility_disclosure_lines(compatibility_disclosure)}"
         f"  Model SHA-256: {identity.sha256}\n"
         f"  Bind: {config.bind.host}:{config.bind.port}\n"
         f"  Authentication: {config.security.auth_mode}\n"
@@ -304,6 +956,8 @@ def run_private_chat(
             f"  Required free VRAM: {safety['required_free_vram_mib']} MiB\n"
         )
     print(resource_text, file=output)
+    if not _prepare_receipt_state(effective_state, input_fn, output):
+        return 0
     if not confirm_action(
         input_fn,
         output,
@@ -312,11 +966,31 @@ def run_private_chat(
         print("No listener or model was started.", file=output)
         return 0
 
-    session = _start_embedded_session(config, alias, profile, effective_state)
+    # Inspection and load are separate steps. This refuses the case where the
+    # path still names a file but no longer names the file whose metadata and
+    # resource decision the operator just confirmed. The complete byte digest
+    # is re-verified again by the embedded engine before any native call.
+    verify_model_unchanged(witness)
+    session = _start_embedded_session(
+        config,
+        alias,
+        profile,
+        effective_state,
+        identity=identity,
+    )
     api_key = _profile_api_key(config, alias)
     messages: list[dict] = []
+    if trial_record is not None:
+        # Scoped to this conversation. It is not injected into a request
+        # from any other harness, and what the model answers about itself
+        # remains its own claim, not identity evidence.
+        messages.append(
+            {"role": "system", "content": _identity_instruction(alias, trial_record)}
+        )
     print(
-        f"Local chat ready at {session.server.base_url}. Type /exit to stop the model.",
+        f"Local chat ready at {session.server.base_url}. Type /exit to stop the model.\n"
+        "A model's description of itself is not identity evidence. The verified local\n"
+        f"identity is alias {alias}, SHA-256 {identity.sha256}.",
         file=output,
     )
     try:
@@ -339,9 +1013,11 @@ def run_private_chat(
             print(f"model> {answer_text}", file=output)
     finally:
         session.close()
-    valid, count = session.receipts.verify_chain()
+    integrity_valid, count = session.receipts.verify_chain()
     print(
-        f"Model stopped. Receipt chain valid: {str(valid).lower()}. Requests recorded: {count}.",
+        f"Model stopped. Receipt chain integrity valid: {str(integrity_valid).lower()} "
+        f"(scope: chain, checkpoint and canonical storage; not specification conformance). "
+        f"Requests recorded: {count}.",
         file=output,
     )
     return 0
@@ -354,15 +1030,30 @@ def run_profile_gateway(
     *,
     state_dir: Path | None = None,
     connector_format: str = "manual",
+    trial_model: str | None = None,
+    trial_alias: str | None = None,
 ) -> int:
-    """Run one bounded tested profile for an existing local harness."""
+    """Run one bounded confirmed profile for an existing local harness."""
     config = load_config_file(config_path)
-    alias, profile = _select_tested_profile(config, input_fn, output)
+    if trial_model is not None:
+        prepared = _prepare_trial(config, trial_model, trial_alias, input_fn, output)
+        if prepared is None:
+            return 0
+        config, alias, profile, _record = prepared
+    else:
+        alias, profile = _select_tested_profile(config, input_fn, output)
     identity = resolve_contained_model(
         profile.model_path, list(config.model_roots), config.ollama_manifest_root
     )
+    witness = witness_model_file(identity.path)
+    compatibility, compatibility_disclosure = derive_compatibility_state(profile, identity)
     cgroup, safety = _model_load_safety(identity, config.runtime.gpu_layers)
-    effective_state = (state_dir or default_state_path()).resolve()
+    # Never resolved. `Path.resolve()` follows every symbolic link in the
+    # path, so the confined walk received the link's target and had nothing
+    # left to refuse: a state path declared through a link was silently
+    # replaced by whatever it named (independent review of the C1 repair,
+    # C1-R1). A path the operator declares is used exactly as declared.
+    effective_state = Path(state_dir) if state_dir is not None else default_state_path()
     gpu_text = (
         f"  Free VRAM: {safety['gpu']['free_mib']} MiB\n"
         if safety["gpu"] is not None else "  GPU route: disabled\n"
@@ -371,6 +1062,8 @@ def run_profile_gateway(
         f"\nHarness gateway\n"
         f"  Model: {profile.display_name}\n"
         f"  Alias: {alias}\n"
+        f"  Compatibility: {_compatibility_text(compatibility, compatibility_disclosure)}\n"
+        f"{_compatibility_disclosure_lines(compatibility_disclosure)}"
         f"  Model SHA-256: {identity.sha256}\n"
         f"  Cgroup memory maximum: {cgroup['memory.max'] // (1024**2)} MiB\n"
         f"  Available RAM: {safety['available_ram_bytes'] // (1024**2)} MiB\n"
@@ -381,11 +1074,23 @@ def run_profile_gateway(
         f"  Receipt state: {effective_state}\n",
         file=output,
     )
+    if not _prepare_receipt_state(effective_state, input_fn, output):
+        return 0
     if not confirm_action(input_fn, output, "Load this model for an existing harness? [y/N] "):
         print("No listener or model was started.", file=output)
         return 0
 
-    session = _start_embedded_session(config, alias, profile, effective_state)
+    # Refuses a file replaced between inspection and load, as in the private
+    # test chat. No identity instruction is added here: the private test chat
+    # scopes one to its own conversation, and harness traffic is unchanged.
+    verify_model_unchanged(witness)
+    session = _start_embedded_session(
+        config,
+        alias,
+        profile,
+        effective_state,
+        identity=identity,
+    )
     api_key = _profile_api_key(config, alias) or ""
     connector = emit(
         connector_format,
@@ -407,25 +1112,117 @@ def run_profile_gateway(
         print("", file=output)
     finally:
         session.close()
-    valid, count = session.receipts.verify_chain()
+    integrity_valid, count = session.receipts.verify_chain()
     print(
-        f"Model stopped. Receipt chain valid: {str(valid).lower()}. Requests recorded: {count}.",
+        f"Model stopped. Receipt chain integrity valid: {str(integrity_valid).lower()} "
+        f"(scope: chain, checkpoint and canonical storage; not specification conformance). "
+        f"Requests recorded: {count}.",
         file=output,
     )
     return 0
 
 
+_INVENTORY_HEADING = (
+    "\nLocal model inventory\n"
+    "  Every discovered entry is listed. Names and sizes come from manifests and\n"
+    "  file lengths, so listing does not hash a weight file.\n"
+    "  Availability is whether the bytes are held here. Compatibility is whether\n"
+    "  PLAG IN has an exact reviewed profile for them. They are separate.\n"
+    "  Only an exact compatibility-tested model is configured automatically. Any\n"
+    "  other held model may receive a bounded unverified trial, which writes no\n"
+    "  configuration and promotes nothing."
+)
+
+
 def _setup_configure(active_config: Path | None, input_fn, output) -> Path | None:
+    manifest_root = Path.home() / ".ollama" / "models"
+    configured = None
+    if active_config is not None and active_config.is_file():
+        configured = load_config_file(active_config)
+        if configured.ollama_manifest_root is not None:
+            manifest_root = configured.ollama_manifest_root
+
+    rows = (
+        _inventory_rows(configured, manifest_root)
+        if configured is not None
+        else [
+            _InventoryRow(
+                label=(
+                    f"{entry.tag} | {_held_size_text(entry.held_size_bytes)} | "
+                    f"available: {entry.availability} | compatibility: unverified"
+                    if entry.availability == AVAILABILITY_LOCAL_COMPLETE
+                    else f"{entry.tag} | available: {entry.availability} | "
+                    f"not startable: {entry.reason}"
+                ),
+                startable=entry.availability == AVAILABILITY_LOCAL_COMPLETE,
+                reason=entry.reason,
+                compatibility_status="unverified",
+                alias=_trial_alias_for(entry.tag),
+                entry=entry,
+            )
+            for entry in discover_held_models(manifest_root, [])
+        ]
+    )
+
+    candidate = detect_tested_candidate(manifest_root=manifest_root)
+    if rows:
+        selected = _select_inventory_row(rows, input_fn, output, _INVENTORY_HEADING)
+        if selected is None:
+            return active_config
+        if not selected.startable:
+            print(
+                f"This entry cannot be started: {selected.reason}.\n"
+                "Its bytes are not held complete on this computer, which is not the "
+                "same as the model being unsupported. No configuration was written.",
+                file=output,
+            )
+            return active_config
+        if selected.compatibility_status != "tested":
+            tested_digest = (
+                f"sha256:{candidate['model']['declared_sha256']}"
+                if candidate.get("available") else None
+            )
+            entry = selected.entry
+            if entry is None or entry.declared_digest != tested_digest:
+                print(
+                    "Selected model is held locally but has not passed the exact PLAG IN "
+                    "compatibility trial. No configuration was written.\n"
+                    "  Run a bounded unverified trial instead, from Start a private test "
+                    "chat, or with:\n"
+                    f"    plag-in chat --trial-model {entry.tag if entry else '<tag>'}\n"
+                    "  A trial changes no configuration and promotes no model to tested.",
+                    file=output,
+                )
+                return active_config
     return configure_tested_model(
         input_fn=input_fn,
         output=output,
         config_path=active_config or default_config_path(),
+        candidate=candidate,
     )
 
 
 def _setup_chat(config_path: Path, input_fn, output) -> int:
     try:
-        return _launch_bounded_command(["chat", "--config", str(config_path)])
+        config = load_config_file(config_path)
+    except PlagInError as exc:
+        print(f"Chat did not start: {exc.message}", file=output)
+        return 1
+    rows = [
+        row
+        for row in _inventory_rows(config, _manifest_root_for(config))
+        if row.startable
+    ]
+    argv = ["chat", "--config", str(config_path)]
+    if rows:
+        selected = _select_inventory_row(rows, input_fn, output, _INVENTORY_HEADING)
+        if selected is None:
+            print("No model was started.", file=output)
+            return 0
+        if selected.compatibility_status != "tested" and selected.entry is not None:
+            argv += ["--trial-model", selected.entry.tag, "--trial-alias", selected.alias]
+    try:
+        return _launch_bounded_command(argv)
     except PlagInError as exc:
         print(f"Chat did not start: {exc.message}", file=output)
         return 1
@@ -535,11 +1332,17 @@ def _inspect_configured_profiles(config) -> list[dict]:
     """
     profiles_report: list[dict] = []
     for alias, profile in config.profiles.items():
+        # The configured label is reported as what it is, a configuration
+        # value. `compatibility_status` is the derived state, and until the
+        # bytes are resolved nothing has been established about them
+        # (independent review of the general model admission repair, F1-R1).
         entry: dict = {
             "alias": alias,
             "display_name": profile.display_name,
             "engine": profile.engine,
-            "compatibility_status": profile.compatibility_status,
+            "configured_compatibility_status": profile.compatibility_status,
+            "compatibility_status": "unverified",
+            "compatibility_reason": "model_bytes_not_resolved",
             "configured_model_path": str(profile.model_path),
         }
         try:
@@ -561,6 +1364,7 @@ def _inspect_configured_profiles(config) -> list[dict]:
             )
             profiles_report.append(entry)
             continue
+        derived, disclosure = derive_compatibility_state(profile, identity)
         entry.update(
             status="inspected",
             resolved_path=identity.path,
@@ -570,6 +1374,11 @@ def _inspect_configured_profiles(config) -> list[dict]:
             estimated_memory_gb=_memory_estimate_gb(identity.size_bytes),
             estimate_label="estimate",
             capability_state="unknown",
+            compatibility_status=derived,
+            compatibility_reason=disclosure.get("reason", ""),
+            compatibility_record=disclosure.get("compatibility_record"),
+            compatibility_evidence=disclosure,
+            recorded_model_sha256=disclosure.get("recorded_model_sha256"),
         )
         profiles_report.append(entry)
     return profiles_report
@@ -655,8 +1464,12 @@ def cmd_serve(args: argparse.Namespace) -> dict:
     identity = resolve_contained_model(
         Path(args.model_path), list(config.model_roots), config.ollama_manifest_root
     )
+    compatibility_status, compatibility_disclosure = _serve_compatibility_state(
+        config, identity, args.engine
+    )
     cgroup, safety = _model_load_safety(identity, config.runtime.gpu_layers)
     runtime_summary = _runtime_profile_summary(config, identity, args.engine)
+    runtime_summary["compatibility"] = compatibility_disclosure
     runtime_summary["resource_safety"] = {
         "cgroup_memory_high_bytes": cgroup["memory.high"],
         "cgroup_memory_max_bytes": cgroup["memory.max"],
@@ -684,7 +1497,10 @@ def cmd_serve(args: argparse.Namespace) -> dict:
     registry.verify_identity(args.alias)
 
     state = StateLayout(Path(args.state_dir)).ensure()
-    receipt_store = ReceiptStore(state.receipts_file, hmac_key_path=state.receipts_hmac_key_file)
+    # Follows the pointer for the life of the process (second pass, D2): a
+    # store activated while this gateway serves takes effect on the next
+    # receipt, with no restart and no documented stop-before-initialise step.
+    receipt_store = ActiveReceiptStore(state)
     context = GatewayContext(config, registry, receipt_store, ENGINE_ADAPTERS)
 
     # Reserve the gateway listener before the engine starts (D): a bind
@@ -737,6 +1553,8 @@ def cmd_serve(args: argparse.Namespace) -> dict:
                     gpu_offload=runtime_receipt_profile.get("gpu_offload"),
                     runtime_profile=runtime_receipt_profile,
                     inference_backend=embedded,
+                    compatibility_status=compatibility_status,
+                    compatibility_evidence=compatibility_disclosure,
                 ),
             )
             server.start()
@@ -810,6 +1628,8 @@ def cmd_serve(args: argparse.Namespace) -> dict:
                 gpu_offload=runtime_receipt_profile.get("gpu_offload"),
                 runtime_profile=runtime_receipt_profile,
                 backend_api_key=backend_api_key,
+                compatibility_status=compatibility_status,
+                compatibility_evidence=compatibility_disclosure,
             ),
         )
         server.start()
@@ -845,7 +1665,12 @@ def cmd_serve(args: argparse.Namespace) -> dict:
 def cmd_status(args: argparse.Namespace) -> dict:
     state = StateLayout(Path(args.state_dir))
     supervisor = Supervisor(state.sessions_dir)
-    return supervisor.status(args.alias)
+    status = dict(supervisor.status(args.alias))
+    # Both receipt stores and their roles, always: an operator must be able to
+    # see that a legacy store still exists and is no longer written to, rather
+    # than infer it from a line that is not there.
+    status["receipt_stores"] = state.receipt_store_roles()
+    return status
 
 
 def cmd_stop(args: argparse.Namespace) -> dict:
@@ -890,10 +1715,41 @@ def cmd_verify(args: argparse.Namespace) -> dict:
 
 def cmd_receipt(args: argparse.Namespace) -> dict:
     state = StateLayout(Path(args.state_dir))
-    store = ReceiptStore(state.receipts_file, hmac_key_path=state.receipts_hmac_key_file)
+
+    if args.initialise_current_store:
+        destination = Path(args.store_path) if args.store_path else state.base / CURRENT_STORE_FILENAME
+        return _initialise_receipt_state(state, destination)
+
+    # One pointer read for all three paths: a check that read the pointer once
+    # per path could assess a store against another store's key (second pass, D3).
+    active = state.active_store_snapshot()
+    store_path = active.store
+    key_path = active.hmac_key
+    checkpoint_path = active.checkpoint
+
+    if args.check_conformance:
+        # The current store only: a legacy record is evidence under its own
+        # historical rules and is not conformance evidence for this schema.
+        result = check_conformance(store_path, key_path, checkpoint_path)
+        result["store_path"] = str(store_path)
+        result["receipt_stores"] = state.receipt_store_roles()
+        return result
+
+    store = ReceiptStore(store_path, hmac_key_path=key_path)
     if args.check_chain:
-        valid, count = store.verify_chain()
-        return {"valid": valid, "record_count": count}
+        # Storage integrity, not specification conformance: this establishes
+        # that the HMAC chain and the authenticated checkpoint agree over the
+        # stored records. It is deliberately not reported as `valid`, because a
+        # caller reading that word would take it for conformance, which this
+        # scope does not assess. Run `--check-conformance` for that.
+        integrity_valid, count = store.verify_chain()
+        return {
+            "integrity_valid": integrity_valid,
+            "record_count": count,
+            "verification_scope": "chain_checkpoint_storage",
+            "store_path": str(store_path),
+            "receipt_stores": state.receipt_store_roles(),
+        }
     return store.get(args.request_id)
 
 
@@ -910,6 +1766,8 @@ def cmd_chat(args: argparse.Namespace) -> None:
         sys.stdout,
         state_dir=Path(args.state_dir),
         max_tokens=args.max_tokens,
+        trial_model=args.trial_model,
+        trial_alias=args.trial_alias,
     )
     return None
 
@@ -921,6 +1779,8 @@ def cmd_gateway(args: argparse.Namespace) -> None:
         sys.stdout,
         state_dir=Path(args.state_dir),
         connector_format=args.connector_format,
+        trial_model=args.trial_model,
+        trial_alias=args.trial_alias,
     )
     return None
 
@@ -932,6 +1792,23 @@ def cmd_doctor(args: argparse.Namespace) -> dict:
 
 def _add_common_state_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--state-dir", required=True)
+
+
+def _add_trial_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--trial-model",
+        default=None,
+        help=(
+            "run one bounded unverified trial of a held local model, named by its "
+            "local tag or held path; nothing is written to the configuration and "
+            "no model is promoted to tested"
+        ),
+    )
+    parser.add_argument(
+        "--trial-alias",
+        default=None,
+        help="alias for the trial profile; derived from the local tag when absent",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -987,6 +1864,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_chat.add_argument("--config", default=str(default_config_path()))
     p_chat.add_argument("--state-dir", default=str(default_state_path()))
     p_chat.add_argument("--max-tokens", type=int, default=256)
+    _add_trial_args(p_chat)
     p_chat.set_defaults(func=cmd_chat)
 
     p_gateway = sub.add_parser("gateway")
@@ -997,6 +1875,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="manual",
         choices=["manual", "openai-env", "json"],
     )
+    _add_trial_args(p_gateway)
     p_gateway.set_defaults(func=cmd_gateway)
 
     p_status = sub.add_parser("status")
@@ -1015,9 +1894,55 @@ def build_parser() -> argparse.ArgumentParser:
     p_verify.add_argument("--alias", default=None)
     p_verify.set_defaults(func=cmd_verify)
 
-    p_receipt = sub.add_parser("receipt")
-    p_receipt.add_argument("--request-id", default=None)
-    p_receipt.add_argument("--check-chain", action="store_true")
+    p_receipt = sub.add_parser(
+        "receipt",
+        description=(
+            "Read or check inference receipts. A receipt associates a request "
+            "identifier with an exact weight digest and optional declared source "
+            "and runtime metadata under a local HMAC. It is emitted alongside a "
+            "response. It does not cryptographically bind response content: the "
+            "schema carries no response digest and no authenticated transport "
+            "transcript."
+        ),
+    )
+    p_receipt.add_argument(
+        "--request-id",
+        default=None,
+        help="print the metadata receipt for one request identifier",
+    )
+    p_receipt.add_argument(
+        "--check-chain",
+        action="store_true",
+        help=(
+            "check storage integrity only: the HMAC chain, the authenticated "
+            "checkpoint and canonical storage. This is not a conformance result"
+        ),
+    )
+    p_receipt.add_argument(
+        "--check-conformance",
+        action="store_true",
+        help=(
+            "run every mandatory Inference Receipt Specification rule against the "
+            "current store and report the conformance level assessed"
+        ),
+    )
+    p_receipt.add_argument(
+        "--initialise-current-store",
+        action="store_true",
+        help=(
+            "create a fresh current-schema receipt store beside an existing one; "
+            "the existing store and its checkpoint are left byte-identical"
+        ),
+    )
+    p_receipt.add_argument(
+        "--store-path",
+        default=None,
+        help=(
+            f"destination for --initialise-current-store; must be {CURRENT_STORE_FILENAME} "
+            "directly beneath the state directory, and is refused if it already exists, "
+            "is a symbolic link, or names any other path"
+        ),
+    )
     _add_common_state_args(p_receipt)
     p_receipt.set_defaults(func=cmd_receipt)
 

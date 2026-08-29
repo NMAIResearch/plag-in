@@ -2,7 +2,7 @@ import json
 import stat
 import tempfile
 import unittest
-from dataclasses import fields
+from dataclasses import asdict, fields
 from pathlib import Path
 
 from plag_in.errors import ReceiptPersistenceError
@@ -32,10 +32,10 @@ def _make_receipt(request_id: str, **overrides) -> Receipt:
         backend_address="127.0.0.1:9000",
         input_tokens=7,
         output_tokens=5,
-        latency_ms=12.5,
+        latency_us=12500,
         status="completed",
         content_retained=False,
-        schema_version="3",
+        schema_version="5",
         runtime_source_digest="a" * 64,
         runtime_source_scope=RUNTIME_SOURCE_SCOPE,
     )
@@ -145,12 +145,12 @@ class ReceiptStoreTests(unittest.TestCase):
         self.assertEqual(record["integrity_mode"], "local_hmac")
         self.assertEqual(INTEGRITY_MODE, "local_hmac")
 
-    def test_schema_v3_has_runtime_source_fields(self):
+    def test_current_schema_is_v5_and_has_runtime_source_fields(self):
         field_names = {f.name for f in fields(Receipt)}
         self.assertIn("runtime_source_digest", field_names)
         self.assertIn("runtime_source_scope", field_names)
-        # v3 is the current contract; a freshly built receipt declares it.
-        self.assertEqual(_make_receipt("req-1").schema_version, "3")
+        self.assertEqual(Receipt.__dataclass_fields__["schema_version"].default, "5")
+        self.assertEqual(_make_receipt("req-1").schema_version, "5")
 
     def test_runtime_source_digest_mutation_detected(self):
         # The runtime source digest is a schema-v3 field, so like every
@@ -192,19 +192,83 @@ class ReceiptStoreTests(unittest.TestCase):
         self.assertTrue(valid)
         self.assertEqual(count, 1)
 
-    def test_schema_v2_receipt_without_source_fields_still_appends(self):
-        # Historical v2 stays readable and makes no source-binding claim.
-        record = self.store.append(
-            _make_receipt(
-                "req-v2", schema_version="2",
-                runtime_source_digest=None, runtime_source_scope=None,
-            )
-        )
-        self.assertEqual(record["schema_version"], "2")
-        self.assertIsNone(record["runtime_source_digest"])
+    def test_non_current_schema_writes_are_rejected_without_store_change(self):
+        self.store.append(_make_receipt("req-good"))
+        before_bytes = self.store.path.read_bytes()
+        before_ckpt = self.store._checkpoint_path.read_bytes()  # noqa: SLF001
+        for schema_version in ("2", "999", None, 3):
+            with self.assertRaises(ReceiptPersistenceError):
+                self.store.append(
+                    _make_receipt(
+                        "req-invalid-schema",
+                        schema_version=schema_version,
+                        runtime_source_digest=None,
+                        runtime_source_scope=None,
+                    )
+                )
+        self.assertEqual(self.store.path.read_bytes(), before_bytes)
+        self.assertEqual(self.store._checkpoint_path.read_bytes(), before_ckpt)  # noqa: SLF001
         valid, count = self.store.verify_chain()
         self.assertTrue(valid)
         self.assertEqual(count, 1)
+
+    def test_authenticated_historical_v2_record_remains_readable(self):
+        body = asdict(
+            _make_receipt(
+                "req-v2",
+                schema_version="2",
+                runtime_source_digest=None,
+                runtime_source_scope=None,
+            )
+        )
+        body.pop("runtime_source_digest")
+        body.pop("runtime_source_scope")
+        # A real version 2 record predates `spec_version` and canonical-byte
+        # writing alike, so it carries neither. The line below is deliberately
+        # written in non-canonical form, which is what such a record looks like
+        # on disk and what the byte check must keep readable.
+        body.pop("spec_version")
+        body["integrity_mode"] = INTEGRITY_MODE
+        record = dict(body)
+        record["prev_hmac"] = "0" * 64
+        record["hmac"] = self.store._record_hmac(record["prev_hmac"], record)  # noqa: SLF001
+        self.store.path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+        self.store._write_checkpoint(1, record["hmac"])  # noqa: SLF001
+
+        valid, count = self.store.verify_chain()
+        self.assertTrue(valid)
+        self.assertEqual(count, 1)
+        self.assertEqual(self.store.get("req-v2")["schema_version"], "2")
+
+    def test_authenticated_unknown_or_malformed_schema_invalidates_chain(self):
+        for schema_version, digest, scope in (
+            ("999", None, None),
+            ("3", None, RUNTIME_SOURCE_SCOPE),
+            ("3", "a" * 64, "runtime_python_source:wrong"),
+            ("2", "a" * 64, RUNTIME_SOURCE_SCOPE),
+        ):
+            with self.subTest(schema_version=schema_version, digest=digest, scope=scope):
+                store = ReceiptStore(
+                    self.tmp_path / f"invalid-{schema_version}-{len(str(digest))}-{len(str(scope))}.jsonl",
+                    hmac_key_path=self.tmp_path / f"invalid-{schema_version}-{len(str(digest))}-{len(str(scope))}.key",
+                )
+                body = asdict(
+                    _make_receipt(
+                        "req-invalid-stored-schema",
+                        schema_version=schema_version,
+                        runtime_source_digest=digest,
+                        runtime_source_scope=scope,
+                    )
+                )
+                body["integrity_mode"] = INTEGRITY_MODE
+                record = dict(body)
+                record["prev_hmac"] = "0" * 64
+                record["hmac"] = store._record_hmac(record["prev_hmac"], record)  # noqa: SLF001
+                store.path.write_text(json.dumps(record, sort_keys=True) + "\n", encoding="utf-8")
+                store._write_checkpoint(1, record["hmac"])  # noqa: SLF001
+                valid, count = store.verify_chain()
+                self.assertFalse(valid)
+                self.assertEqual(count, 1)
 
     def test_schema_has_no_content_or_content_digest_field(self):
         field_names = {f.name for f in fields(Receipt)}

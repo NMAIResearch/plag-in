@@ -9,9 +9,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from plag_in.cli import (
+    _assess_trial_admission,
     _bounded_command,
+    _identity_instruction,
+    _inventory_rows,
     _model_load_safety,
+    _prepare_receipt_state,
+    _setup_configure,
     _require_runtime_confirmation,
+    _trial_alias_for,
     build_parser,
     cmd_doctor,
     cmd_inspect,
@@ -19,8 +25,18 @@ from plag_in.cli import (
     run_private_chat,
     run_profile_gateway,
 )
+from plag_in.config import load_config_file
 from plag_in.errors import ConfigurationError, ModelIdentityMismatchError
+from plag_in.inventory import (
+    AVAILABILITY_LOCAL_COMPLETE,
+    AVAILABILITY_LOCAL_INCOMPLETE,
+    AVAILABILITY_REMOTE_ONLY,
+    HeldModel,
+)
 from plag_in.onboarding import doctor_report, render_doctor, run_setup_assistant
+from plag_in.identity import hash_file
+from tests.support import FIXTURE_COMPATIBILITY_RECORD, registered_fixture_compatibility
+from tests.unit.test_gguf_metadata import build_gguf
 
 
 class _TTYBuffer(io.StringIO):
@@ -29,6 +45,9 @@ class _TTYBuffer(io.StringIO):
 
 
 class CliParserTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(registered_fixture_compatibility())
+
     def test_expected_commands_present(self):
         parser = build_parser()
         subparsers_action = next(a for a in parser._actions if isinstance(a, argparse._SubParsersAction))  # noqa: SLF001
@@ -139,12 +158,102 @@ class CliParserTests(unittest.TestCase):
         with (
             patch("sys.stdin.isatty", return_value=True),
             patch("sys.stdout", stdout),
-            patch("builtins.input", return_value="8"),
+            patch(
+                "plag_in.input_control._read_terminal_key",
+                side_effect=["8", "\r"],
+            ),
         ):
             result = main([])
         self.assertEqual(result, 0)
         self.assertIn("PLAG IN setup", stdout.getvalue())
         self.assertIn("Setup closed.", stdout.getvalue())
+
+    def test_receipt_migration_decline_occurs_before_model_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            (state / "receipts.jsonl").write_text(
+                json.dumps({"schema_version": "3"}) + "\n",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            with patch("plag_in.cli._initialise_receipt_state") as initialise:
+                ready = _prepare_receipt_state(state, lambda _: "n", output)
+        self.assertFalse(ready)
+        initialise.assert_not_called()
+        self.assertIn("Receipt migration required before inference", output.getvalue())
+        self.assertIn("No listener or model was started", output.getvalue())
+
+    def test_receipt_migration_confirmation_activates_current_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state = Path(tmp)
+            (state / "receipts.jsonl").write_text(
+                json.dumps({"schema_version": "3"}) + "\n",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+            activated = {
+                "active_pointer": {"current_store": str(state / "receipts.v5.jsonl")}
+            }
+            with patch(
+                "plag_in.cli._initialise_receipt_state", return_value=activated
+            ) as initialise:
+                ready = _prepare_receipt_state(state, lambda _: "yes", output)
+        self.assertTrue(ready)
+        initialise.assert_called_once()
+        self.assertIn("Historical receipt bytes were not modified", output.getvalue())
+
+    def test_setup_lists_unverified_held_model_without_configuring_it(self):
+        held = HeldModel(
+            tag="other:7b",
+            source="ollama_manifest",
+            availability=AVAILABILITY_LOCAL_COMPLETE,
+            reason="",
+            blob_path="/tmp/other",
+            declared_digest="sha256:" + "b" * 64,
+            declared_size_bytes=7 * 1024**3,
+            held_size_bytes=7 * 1024**3,
+        )
+        candidate = {
+            "available": True,
+            "model": {"declared_sha256": "a" * 64},
+        }
+        output = io.StringIO()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[held]),
+            patch("plag_in.cli.detect_tested_candidate", return_value=candidate),
+            patch("plag_in.cli.configure_tested_model") as configure,
+        ):
+            result = _setup_configure(None, lambda _: "1", output)
+        self.assertIsNone(result)
+        configure.assert_not_called()
+        self.assertIn("held locally", output.getvalue())
+        self.assertIn("No configuration was written", output.getvalue())
+        self.assertIn("other:7b", output.getvalue())
+
+    def test_setup_keeps_a_non_startable_entry_visible_with_its_reason(self):
+        remote_only = HeldModel(
+            tag="remote:cloud",
+            source="ollama_manifest",
+            availability=AVAILABILITY_REMOTE_ONLY,
+            reason="manifest_declares_no_model_layer",
+            blob_path="",
+            declared_digest="",
+            declared_size_bytes=None,
+            held_size_bytes=None,
+        )
+        output = io.StringIO()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[remote_only]),
+            patch("plag_in.cli.detect_tested_candidate", return_value={"available": False}),
+            patch("plag_in.cli.configure_tested_model") as configure,
+        ):
+            _setup_configure(None, lambda _: "1", output)
+        configure.assert_not_called()
+        text = output.getvalue()
+        self.assertIn("remote:cloud", text)
+        self.assertIn("remote_only", text)
+        self.assertIn("manifest_declares_no_model_layer", text)
+        self.assertIn("not the same as the model being unsupported", text)
 
     def test_noninteractive_serve_requires_explicit_runtime_confirmation(self):
         args = argparse.Namespace(confirm_runtime_profile=False)
@@ -235,6 +344,7 @@ class CliParserTests(unittest.TestCase):
                             "engine": "libllama",
                             "display_name": "Fixture",
                             "compatibility_status": "tested",
+                            "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
                         }
                     },
                     "security": {
@@ -327,7 +437,10 @@ class CliParserTests(unittest.TestCase):
         self.assertTrue(session.closed)
         request.assert_called_once()
         self.assertIn("model> local answer", output.getvalue())
-        self.assertIn("Receipt chain valid: true", output.getvalue())
+        # A1: the shutdown line reports storage integrity and names its scope.
+        # It must not read as a specification-conformance result.
+        self.assertIn("Receipt chain integrity valid: true", output.getvalue())
+        self.assertIn("not specification conformance", output.getvalue())
 
     def test_bounded_chat_command_has_hard_memory_and_swap_controls(self):
         with patch("plag_in.cli.shutil.which", return_value="/usr/bin/systemd-run"):
@@ -455,7 +568,450 @@ class CliParserTests(unittest.TestCase):
         self.assertEqual(calls, [config_path])
 
 
+_SAFETY = (
+    {"memory.high": 10 * 1024**3, "memory.max": 12 * 1024**3, "memory.swap.max": 2 * 1024**3},
+    {
+        "available_ram_bytes": 32 * 1024**3,
+        "required_available_ram_bytes": 20 * 1024**3,
+        "gpu": None,
+        "required_free_vram_mib": None,
+    },
+)
+
+_ADMITTED_RESOURCES = {
+    "outcome": "admitted",
+    "policy_validation_status": "provisional_unvalidated",
+    "cgroup": _SAFETY[0],
+    "preflight": _SAFETY[1],
+    "failures": [],
+    "unassessed": [],
+}
+
+
+class _FakeSession:
+    """Records what a session was asked to serve, without loading anything."""
+
+    class _Server:
+        base_url = "http://127.0.0.1:19080"
+
+    class _Receipts:
+        @staticmethod
+        def verify_chain():
+            return True, 1
+
+    def __init__(self):
+        self.server = self._Server()
+        self.receipts = self._Receipts()
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+class TrialAdmissionTests(unittest.TestCase):
+    """Probes 1, 2, 11 and 12: the unverified trial route.
+
+    Every fixture is a scratch GGUF file. No native library, no held model
+    and no real host measurement is used.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.models = self.root / "models"
+        self.models.mkdir()
+        self.tested = build_gguf(self.models / "tested.gguf", architecture="tested-arch")
+        self.held = build_gguf(self.models / "held.gguf", architecture="held-arch")
+        # The record is registered against the bytes actually written, so
+        # the tested route is exercised on matching evidence rather than on
+        # a stored label the derivation would refuse.
+        self.enterContext(
+            registered_fixture_compatibility(model_sha256=hash_file(self.tested))
+        )
+
+    def _config_path(self) -> Path:
+        library = self.root / "libllama.so"
+        library.write_bytes(b"fixture-library")
+        path = self.root / "config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "model_roots": [str(self.models)],
+                    "engines": {
+                        "libllama": {
+                            "library": str(library),
+                            "library_sha256": "a" * 64,
+                            "ggml_base_library": str(library),
+                            "ggml_base_library_sha256": "b" * 64,
+                            "ggml_library": str(library),
+                            "ggml_library_sha256": "c" * 64,
+                            "backend_libraries": [{"path": str(library), "sha256": "d" * 64}],
+                            "upstream_identity": "fixture",
+                        }
+                    },
+                    "profiles": {
+                        "tested-fixture": {
+                            "model_path": str(self.tested),
+                            "engine": "libllama",
+                            "display_name": "Tested Fixture",
+                            "compatibility_status": "tested",
+                            "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
+                        }
+                    },
+                    "security": {
+                        "auth_mode": "api_key",
+                        "api_keys": [
+                            {"id": "operator", "secret": "s" * 64, "origin": "loopback"}
+                        ],
+                        "content_logging": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def _held_entry(self, path: Path | None = None, **overrides) -> HeldModel:
+        target = path or self.held
+        fields = {
+            "tag": target.name,
+            "source": "gguf_root",
+            "availability": AVAILABILITY_LOCAL_COMPLETE,
+            "reason": "",
+            "blob_path": str(target),
+            "declared_digest": "",
+            "declared_size_bytes": target.stat().st_size,
+            "held_size_bytes": target.stat().st_size,
+        }
+        fields.update(overrides)
+        return HeldModel(**fields)
+
+    # -- probe 1: the tested route is unchanged ---------------------------
+
+    def test_tested_profiles_are_listed_first(self):
+        config = load_config_file(self._config_path())
+        rows = _inventory_rows(config, None)
+        self.assertEqual(rows[0].compatibility_status, "tested")
+        self.assertEqual(rows[0].alias, "tested-fixture")
+        self.assertTrue(rows[0].startable)
+        self.assertIn("tested-fixture", rows[0].label)
+
+    def test_the_configured_tested_model_is_not_repeated_as_unverified(self):
+        config = load_config_file(self._config_path())
+        rows = _inventory_rows(config, None)
+        self.assertEqual([row.compatibility_status for row in rows], ["tested", "unverified"])
+        self.assertNotIn(str(self.tested), [row.entry.blob_path for row in rows if row.entry])
+
+    def test_a_chat_without_a_trial_selects_the_tested_profile_unchanged(self):
+        output = io.StringIO()
+        session = _FakeSession()
+        with (
+            patch("plag_in.cli._start_embedded_session", return_value=session) as start,
+            patch("plag_in.cli._model_load_safety", return_value=_SAFETY),
+            patch(
+                "plag_in.cli._local_chat_request",
+                return_value={"content": "answer", "payload": {}},
+            ),
+        ):
+            choices = iter(["yes", "/exit"])
+            run_private_chat(
+                self._config_path(),
+                lambda _: next(choices),
+                output,
+                state_dir=self.root / "state",
+            )
+        _config, alias, profile, _state = start.call_args.args
+        self.assertEqual(alias, "tested-fixture")
+        self.assertEqual(profile.compatibility_status, "tested")
+        self.assertIn("Compatibility: tested", output.getvalue())
+
+    # -- probe 2: an unverified model runs without a persistent change ----
+
+    def test_an_approved_trial_carries_an_unverified_ephemeral_profile(self):
+        config_path = self._config_path()
+        before = config_path.read_bytes()
+        output = io.StringIO()
+        session = _FakeSession()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[self._held_entry()]),
+            patch(
+                "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+            ),
+            patch("plag_in.cli._start_embedded_session", return_value=session) as start,
+            patch("plag_in.cli._model_load_safety", return_value=_SAFETY),
+            patch(
+                "plag_in.cli._local_chat_request",
+                return_value={"content": "answer", "payload": {}},
+            ),
+        ):
+            choices = iter(["yes", "yes", "/exit"])
+            run_private_chat(
+                config_path,
+                lambda _: next(choices),
+                output,
+                state_dir=self.root / "state",
+                trial_model="held.gguf",
+            )
+        trial_config, alias, profile, _state = start.call_args.args
+        self.assertEqual(alias, "trial-held.gguf")
+        self.assertEqual(profile.compatibility_status, "unverified")
+        self.assertEqual(str(profile.model_path), str(self.held))
+        self.assertEqual(config_path.read_bytes(), before, "no configuration may be written")
+        self.assertEqual(sorted(trial_config.profiles), ["tested-fixture", "trial-held.gguf"])
+
+    def test_the_trial_disclosure_states_every_confirmed_value(self):
+        output = io.StringIO()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[self._held_entry()]),
+            patch(
+                "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+            ),
+            patch("plag_in.cli._start_embedded_session") as start,
+        ):
+            run_private_chat(
+                self._config_path(),
+                lambda _: "n",
+                output,
+                state_dir=self.root / "state",
+                trial_model="held.gguf",
+            )
+        text = output.getvalue()
+        start.assert_not_called()
+        for expected in (
+            "Complete SHA-256:",
+            "Held size:",
+            "Architecture: held-arch",
+            "Declared context length: 4096",
+            "Chat template present: true",
+            "Unassessed metadata:",
+            "Requested runtime:",
+            "Cgroup memory maximum:",
+            "Available RAM:",
+            "This is an unverified local trial",
+            "No listener or model was started",
+        ):
+            self.assertIn(expected, text, expected)
+
+    def test_a_declined_trial_starts_nothing(self):
+        output = io.StringIO()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[self._held_entry()]),
+            patch(
+                "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+            ),
+            patch("plag_in.cli._start_embedded_session") as start,
+        ):
+            result = run_private_chat(
+                self._config_path(),
+                lambda _: "n",
+                output,
+                state_dir=self.root / "state",
+                trial_model="held.gguf",
+            )
+        self.assertEqual(result, 0)
+        start.assert_not_called()
+
+    def test_a_trial_alias_is_derived_from_a_tag_without_inventing_identity(self):
+        self.assertEqual(_trial_alias_for("qwen2.5:3b"), "trial-qwen2.5-3b")
+        self.assertEqual(_trial_alias_for("a/b"), "trial-a-b")
+        self.assertLessEqual(len(_trial_alias_for("x" * 200)), 64)
+
+    # -- probe 11: a refused trial starts and records nothing -------------
+
+    def test_a_remote_only_entry_is_refused_before_any_load(self):
+        output = io.StringIO()
+        entry = self._held_entry(
+            availability=AVAILABILITY_REMOTE_ONLY,
+            reason="manifest_declares_no_model_layer",
+            blob_path="",
+        )
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[entry]),
+            patch("plag_in.cli._start_embedded_session") as start,
+        ):
+            result = run_private_chat(
+                self._config_path(),
+                lambda _: "yes",
+                output,
+                state_dir=self.root / "state",
+                trial_model="held.gguf",
+            )
+        self.assertEqual(result, 0)
+        start.assert_not_called()
+        self.assertIn("manifest_declares_no_model_layer", output.getvalue())
+        self.assertIn("No listener, engine or model was started", output.getvalue())
+
+    def test_a_non_gguf_selection_is_refused_as_unsupported(self):
+        other = self.models / "not-a-model.bin"
+        other.write_bytes(b"this is not a GGUF file")
+        record = _assess_trial_admission(
+            load_config_file(self._config_path()), self._held_entry(other), "libllama"
+        )
+        self.assertEqual(record["admission"], "refused")
+        self.assertEqual(record["compatibility"], "unsupported")
+        self.assertEqual(record["reason"], "not_gguf")
+
+    def test_a_model_without_a_chat_template_is_refused_as_unsupported(self):
+        bare = build_gguf(self.models / "bare.gguf", chat_template=None)
+        record = _assess_trial_admission(
+            load_config_file(self._config_path()), self._held_entry(bare), "libllama"
+        )
+        self.assertEqual(record["compatibility"], "unsupported")
+        self.assertEqual(record["reason"], "gguf_declares_no_chat_template")
+
+    def test_a_resource_refusal_is_not_reported_as_incompatibility(self):
+        refused = dict(_ADMITTED_RESOURCES, outcome="resource_refused", failures=["no RAM"])
+        with patch("plag_in.cli.evaluate_model_admission", return_value=refused):
+            record = _assess_trial_admission(
+                load_config_file(self._config_path()), self._held_entry(), "libllama"
+            )
+        self.assertEqual(record["admission"], "refused")
+        self.assertEqual(record["reason"], "resource_refused")
+        self.assertEqual(record["compatibility"], "unverified")
+        self.assertEqual(record["availability"], AVAILABILITY_LOCAL_COMPLETE)
+
+    def test_an_absent_blob_is_availability_not_compatibility(self):
+        entry = self._held_entry(
+            availability=AVAILABILITY_LOCAL_INCOMPLETE, reason="declared_blob_absent"
+        )
+        record = _assess_trial_admission(
+            load_config_file(self._config_path()), entry, "libllama"
+        )
+        self.assertEqual(record["reason"], "declared_blob_absent")
+        self.assertEqual(record["compatibility"], "unverified")
+
+    def test_an_unknown_trial_model_is_refused(self):
+        with patch("plag_in.cli.discover_held_models", return_value=[]):
+            with self.assertRaises(ConfigurationError):
+                run_private_chat(
+                    self._config_path(),
+                    lambda _: "yes",
+                    io.StringIO(),
+                    state_dir=self.root / "state",
+                    trial_model="absent:tag",
+                )
+
+    # -- probe 12: the identity instruction -------------------------------
+
+    def test_the_identity_instruction_uses_verified_local_metadata(self):
+        config = load_config_file(self._config_path())
+        with patch(
+            "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+        ):
+            record = _assess_trial_admission(config, self._held_entry(), "libllama")
+        instruction = _identity_instruction("trial-held", record)
+        self.assertIn("trial-held", instruction)
+        self.assertIn(record["identity"]["sha256"], instruction)
+        self.assertIn("held-arch", instruction)
+        self.assertIn("4096", instruction)
+
+    def test_the_identity_instruction_names_no_provider(self):
+        config = load_config_file(self._config_path())
+        with patch(
+            "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+        ):
+            record = _assess_trial_admission(config, self._held_entry(), "libllama")
+        lowered = _identity_instruction("trial-held", record).lower()
+        # "meta" is excluded from this list: it is a substring of "metadata",
+        # which the instruction states truthfully about what it read.
+        for name in ("openai", "anthropic", "claude", "google", "gemini", "mistral", "qwen"):
+            self.assertNotIn(name, lowered, name)
+
+    def test_the_identity_instruction_leads_the_private_chat_conversation(self):
+        output = io.StringIO()
+        session = _FakeSession()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[self._held_entry()]),
+            patch(
+                "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+            ),
+            patch("plag_in.cli._start_embedded_session", return_value=session),
+            patch("plag_in.cli._model_load_safety", return_value=_SAFETY),
+            patch(
+                "plag_in.cli._local_chat_request",
+                return_value={"content": "answer", "payload": {}},
+            ) as request,
+        ):
+            choices = iter(["yes", "yes", "who are you", "/exit"])
+            run_private_chat(
+                self._config_path(),
+                lambda _: next(choices),
+                output,
+                state_dir=self.root / "state",
+                trial_model="held.gguf",
+            )
+        messages = request.call_args.args[3]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("trial-held.gguf", messages[0]["content"])
+        self.assertEqual(messages[1], {"role": "user", "content": "who are you"})
+
+    def test_a_tested_chat_carries_no_identity_instruction(self):
+        output = io.StringIO()
+        session = _FakeSession()
+        with (
+            patch("plag_in.cli._start_embedded_session", return_value=session),
+            patch("plag_in.cli._model_load_safety", return_value=_SAFETY),
+            patch(
+                "plag_in.cli._local_chat_request",
+                return_value={"content": "answer", "payload": {}},
+            ) as request,
+        ):
+            choices = iter(["yes", "hello", "/exit"])
+            run_private_chat(
+                self._config_path(),
+                lambda _: next(choices),
+                output,
+                state_dir=self.root / "state",
+            )
+        messages = request.call_args.args[3]
+        self.assertEqual(messages[0], {"role": "user", "content": "hello"})
+
+    def test_the_chat_states_that_self_description_is_not_identity_evidence(self):
+        output = io.StringIO()
+        session = _FakeSession()
+        with (
+            patch("plag_in.cli.discover_held_models", return_value=[self._held_entry()]),
+            patch(
+                "plag_in.cli.evaluate_model_admission", return_value=dict(_ADMITTED_RESOURCES)
+            ),
+            patch("plag_in.cli._start_embedded_session", return_value=session),
+            patch("plag_in.cli._model_load_safety", return_value=_SAFETY),
+            patch(
+                "plag_in.cli._local_chat_request",
+                return_value={"content": "answer", "payload": {}},
+            ),
+        ):
+            choices = iter(["yes", "yes", "/exit"])
+            run_private_chat(
+                self._config_path(),
+                lambda _: next(choices),
+                output,
+                state_dir=self.root / "state",
+                trial_model="held.gguf",
+            )
+        self.assertIn("not identity evidence", output.getvalue())
+
+    def test_the_harness_gateway_never_injects_an_identity_instruction(self):
+        source = Path(run_profile_gateway.__code__.co_filename).read_text(encoding="utf-8")
+        gateway_body = source.split("def run_profile_gateway", 1)[1].split("\ndef ", 1)[0]
+        self.assertNotIn("_identity_instruction", gateway_body)
+
+    def test_the_trial_flags_are_available_on_both_serving_commands(self):
+        parser = build_parser()
+        for command, extra in (("chat", []), ("gateway", [])):
+            args = parser.parse_args(
+                [command, "--config", "/tmp/c.json", "--state-dir", "/tmp/s",
+                 "--trial-model", "held:latest", *extra]
+            )
+            self.assertEqual(args.trial_model, "held:latest")
+            self.assertIsNone(args.trial_alias)
+
+
 class CliInspectScopeTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(registered_fixture_compatibility())
+
     def _embedded_engine(self, library: Path) -> dict:
         return {
             "library": str(library),
@@ -489,6 +1045,7 @@ class CliInspectScopeTests(unittest.TestCase):
                             "engine": "libllama",
                             "display_name": "Fixture",
                             "compatibility_status": "tested",
+                            "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
                         }
                     },
                 }
@@ -549,6 +1106,7 @@ class CliInspectScopeTests(unittest.TestCase):
                                 "engine": "libllama",
                                 "display_name": "Fixture",
                                 "compatibility_status": "tested",
+                                "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
                             }
                         },
                     }
@@ -601,6 +1159,7 @@ class CliInspectScopeTests(unittest.TestCase):
                                 "engine": "libllama",
                                 "display_name": "Fixture",
                                 "compatibility_status": "tested",
+                                "compatibility_record": FIXTURE_COMPATIBILITY_RECORD.record_id,
                             }
                         },
                     }

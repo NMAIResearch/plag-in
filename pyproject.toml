@@ -1,22 +1,9 @@
 [project]
 name = "plag-in"
-version = "0.1.0a1"
-description = "Private Local AI Gateway source alpha"
-readme = "README.md"
+version = "0.1.0a2"
+description = "Private Local AI Gateway MVP"
 requires-python = ">=3.14"
 dependencies = []
-license = "Apache-2.0"
-authors = [
-  {name = "NM AI Research", email = "NMAIResearch@proton.me"},
-]
-keywords = ["local-llm", "llama-cpp", "privacy", "inference-gateway"]
-classifiers = [
-  "Development Status :: 3 - Alpha",
-  "Environment :: Console",
-  "Operating System :: POSIX :: Linux",
-  "Programming Language :: Python :: 3.14",
-  "Topic :: Scientific/Engineering :: Artificial Intelligence",
-]
 
 [project.scripts]
 plag-in = "plag_in.cli:main"

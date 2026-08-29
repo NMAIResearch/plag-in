@@ -119,6 +119,69 @@ def resource_preflight(
     }
 
 
+def evaluate_model_admission(
+    model_size_bytes: int,
+    gpu_layers: str,
+    *,
+    meminfo_path: Path = Path("/proc/meminfo"),
+    pressure_path: Path = Path("/proc/pressure/memory"),
+    command_runner=subprocess.run,
+    proc_cgroup_path: Path = Path("/proc/self/cgroup"),
+    cgroup_root: Path = Path("/sys/fs/cgroup"),
+) -> dict:
+    """Report the preflight decision for one model without raising.
+
+    `resource_preflight` and `verify_chat_cgroup` are the enforcement path
+    and they raise. A compatibility matrix needs the same measurements for
+    an entry it will not start, so this reports the decision instead. The
+    formula, reserve and thresholds are the same values and remain
+    provisional; nothing here weakens a check.
+
+    `outcome` is `admitted`, `resource_refused` or `measurement_unavailable`.
+    A measurement that could not be taken is never read as headroom.
+    """
+    record: dict = {
+        "outcome": "admitted",
+        "model_size_bytes": model_size_bytes,
+        "requested_gpu_layers": gpu_layers,
+        "policy_validation_status": "provisional_unvalidated",
+        "enforcement_boundary": "cgroup_memory_and_swap_limits",
+        "cgroup": None,
+        "preflight": None,
+        "failures": [],
+        "unassessed": [],
+    }
+    try:
+        record["cgroup"] = verify_chat_cgroup(
+            proc_cgroup_path=proc_cgroup_path, cgroup_root=cgroup_root
+        )
+    except ConfigurationError as exc:
+        record["outcome"] = "measurement_unavailable"
+        record["unassessed"].append("chat_cgroup")
+        record["failures"].append(exc.message)
+        return record
+
+    try:
+        preflight = resource_preflight(
+            model_size_bytes,
+            gpu_layers,
+            meminfo_path=meminfo_path,
+            pressure_path=pressure_path,
+            command_runner=command_runner,
+        )
+    except ConfigurationError as exc:
+        record["outcome"] = "measurement_unavailable"
+        record["unassessed"].append("host_headroom")
+        record["failures"].append(exc.message)
+        return record
+
+    record["preflight"] = preflight
+    if preflight["status"] != "pass":
+        record["outcome"] = "resource_refused"
+        record["failures"] = list(preflight["failures"])
+    return record
+
+
 def _cgroup_file(name: str, *, proc_cgroup_path: Path, cgroup_root: Path) -> Path:
     unified = None
     for line in proc_cgroup_path.read_text(encoding="utf-8").splitlines():

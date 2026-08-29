@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Callable, TextIO
 
 from plag_in.config import is_loopback, load_config_file
+from plag_in.input_control import select_menu, terminal_menu_available
 
 
 def _platform_support(system: str) -> str:
@@ -56,7 +57,7 @@ def doctor_report(config_path: Path | None = None) -> dict:
             "present_model_roots": 0,
             "configured_engines": 0,
             "configured_profiles": 0,
-            "tested_profiles": [],
+            "profiles_configured_tested": [],
         },
         "next_steps": [
             "Review or create a PLAG IN configuration without starting a model.",
@@ -100,7 +101,10 @@ def doctor_report(config_path: Path | None = None) -> dict:
         "configured_engines": len(config.engines),
         "declared_engine_kinds": sorted(engine.kind for engine in config.engines.values()),
         "configured_profiles": len(config.profiles),
-        "tested_profiles": sorted(
+        # A configuration reading, not a compatibility finding: doctor
+        # resolves no model bytes, so it reports which profiles are
+        # configured as tested, never which are.
+        "profiles_configured_tested": sorted(
             alias for alias, profile in config.profiles.items()
             if profile.compatibility_status == "tested"
         ),
@@ -165,7 +169,8 @@ def render_doctor(report: dict) -> str:
             f"  Present model roots: {discovery['present_model_roots']}",
             f"  Configured engines: {discovery['configured_engines']}",
             f"  Configured profiles: {discovery['configured_profiles']}",
-            "  Tested profiles: " + (", ".join(discovery["tested_profiles"]) or "none"),
+            "  Profiles configured tested: "
+            + (", ".join(discovery["profiles_configured_tested"]) or "none"),
             "",
             "Next steps",
         ]
@@ -174,20 +179,28 @@ def render_doctor(report: dict) -> str:
     return "\n".join(lines)
 
 
-_SETUP_MENU = """PLAG IN setup
+_SETUP_OPTIONS = (
+    "Inspect this computer",
+    "Choose or configure a local model",
+    "Start a private test chat",
+    "Connect an existing harness",
+    "Show the missing-model recommendation workflow",
+    "Explain privacy and locality controls",
+    "Show advanced commands",
+    "Exit",
+)
+
+_SETUP_INTRO = """PLAG IN setup
 
 Inspection is read-only. Configuration and model loading each require confirmation.
 Inference uses an authenticated loopback connection with no remote provider.
-
-1. Inspect this computer
-2. Configure a tested existing local model
-3. Start a private test chat
-4. Connect an existing harness
-5. Show the missing-model recommendation workflow
-6. Explain privacy and locality controls
-7. Show advanced commands
-8. Exit
 """
+
+
+def _numbered_setup_menu() -> str:
+    lines = [_SETUP_INTRO.rstrip(), ""]
+    lines.extend(f"{index}. {label}" for index, label in enumerate(_SETUP_OPTIONS, 1))
+    return "\n".join(lines) + "\n"
 
 
 def run_setup_assistant(
@@ -217,12 +230,24 @@ def run_setup_assistant(
         if max_cycles is not None and cycles > max_cycles:
             print("Setup stopped at the buffered-interface safety limit.", file=output)
             return 2
-        print(_SETUP_MENU, file=output)
-        try:
-            choice = input_fn("Select 1-8: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nSetup closed.", file=output)
-            return 0
+        if terminal_menu_available(input_fn, output):
+            print(_SETUP_INTRO, file=output)
+            selected = select_menu(
+                _SETUP_OPTIONS,
+                output,
+                "Use Up and Down, then press Enter. Press q to exit.",
+            )
+            if selected is None:
+                print("Setup closed.", file=output)
+                return 0
+            choice = str(selected)
+        else:
+            print(_numbered_setup_menu(), file=output)
+            try:
+                choice = input_fn("Select 1-8: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nSetup closed.", file=output)
+                return 0
 
         if choice == "1":
             inspected_config = active_config if active_config and active_config.is_file() else None

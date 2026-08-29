@@ -33,7 +33,7 @@ from plag_in.errors import (
     ReceiptPersistenceError,
     UnknownConfigurationFieldError,
 )
-from plag_in.identity import ModelIdentity, canonical_digest
+from plag_in.identity import RUNTIME_SOURCE_SCOPE, ModelIdentity, canonical_digest
 from plag_in.model_paths import resolve_contained_model
 from plag_in.receipts import Receipt, ReceiptStore
 from plag_in.registry import Registry, RegistryEntry
@@ -83,7 +83,9 @@ def _make_receipt(rid, **overrides):
         engine_version="v", model_alias="a", weight_digest="d" * 64, template_digest="d" * 64,
         config_digest="d" * 64, engine_executable_digest="d" * 64, argv_digest="d" * 64,
         locality_level="L1", route="local", listen_address="x",
-        backend_address="y", input_tokens=1, output_tokens=1, latency_ms=1.0, status="completed",
+        backend_address="y", input_tokens=1, output_tokens=1, latency_us=1, status="completed",
+        schema_version="5", runtime_source_digest="d" * 64,
+        runtime_source_scope=RUNTIME_SOURCE_SCOPE,
     )
     base.update(overrides)
     return Receipt(**base)
@@ -306,7 +308,7 @@ class UnsupportedClientCapabilityTypedErrorTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             stack = build_gateway_stack(Path(tmp), alias="fixture-alias")
             try:
-                for path in ("/v1/completions", "/v1/embeddings", "/v1/responses", "/v1/messages"):
+                for path in ("/v1/completions", "/v1/embeddings", "/v1/messages"):
                     status, body, _headers = _post(stack.server.base_url, path, {"model": "fixture-alias"})
                     self.assertEqual(status, 501, path)
                     self.assertEqual(body["error"]["type"], "unsupported_capability")

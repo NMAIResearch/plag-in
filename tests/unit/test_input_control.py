@@ -1,7 +1,7 @@
 import io
 import unittest
 
-from plag_in.input_control import confirm_action, select_number
+from plag_in.input_control import confirm_action, select_menu, select_number
 
 
 class InputControlTests(unittest.TestCase):
@@ -48,6 +48,36 @@ class InputControlTests(unittest.TestCase):
         )
         self.assertEqual(selected, 2)
         self.assertIn("Choose a number from 1 to 3", output.getvalue())
+
+    def test_arrow_menu_moves_and_enter_selects(self):
+        keys = iter(["\x1b[B", "\r"])
+        output = io.StringIO()
+        selected = select_menu(
+            ("first", "second", "third"),
+            output,
+            "Choose",
+            read_key=lambda: next(keys),
+        )
+        self.assertEqual(selected, 2)
+        self.assertIn("Selected: second", output.getvalue())
+
+    def test_arrow_menu_wraps_up_from_first(self):
+        keys = iter(["\x1b[A", "\n"])
+        selected = select_menu(
+            ("first", "second", "third"),
+            io.StringIO(),
+            "Choose",
+            read_key=lambda: next(keys),
+        )
+        self.assertEqual(selected, 3)
+
+    def test_arrow_menu_q_cancels(self):
+        output = io.StringIO()
+        selected = select_menu(
+            ("first",), output, "Choose", read_key=lambda: "q"
+        )
+        self.assertIsNone(selected)
+        self.assertIn("Selection cancelled", output.getvalue())
 
 
 if __name__ == "__main__":

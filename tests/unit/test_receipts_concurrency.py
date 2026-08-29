@@ -14,6 +14,7 @@ import threading
 import unittest
 from pathlib import Path
 
+from plag_in.identity import RUNTIME_SOURCE_SCOPE
 from plag_in.receipts import Receipt, ReceiptStore
 
 _SRC_DIR = str(Path(__file__).parent.parent.parent / "src")
@@ -38,9 +39,12 @@ def _make_receipt(request_id: str) -> Receipt:
         backend_address="127.0.0.1:9000",
         input_tokens=1,
         output_tokens=1,
-        latency_ms=1.0,
+        latency_us=1,
         status="completed",
         content_retained=False,
+        schema_version="5",
+        runtime_source_digest="a" * 64,
+        runtime_source_scope=RUNTIME_SOURCE_SCOPE,
     )
 
 
@@ -73,6 +77,7 @@ _WORKER_SCRIPT = """
 import sys
 sys.path.insert(0, {src_dir!r})
 from pathlib import Path
+from plag_in.identity import RUNTIME_SOURCE_SCOPE
 from plag_in.receipts import Receipt, ReceiptStore
 
 store = ReceiptStore(Path({receipts_path!r}), hmac_key_path=Path({key_path!r}))
@@ -95,9 +100,12 @@ for i in range(int({count!r})):
         backend_address="127.0.0.1:9000",
         input_tokens=1,
         output_tokens=1,
-        latency_ms=1.0,
+        latency_us=1,
         status="completed",
         content_retained=False,
+        schema_version="5",
+        runtime_source_digest="a" * 64,
+        runtime_source_scope=RUNTIME_SOURCE_SCOPE,
     ))
 """
 
