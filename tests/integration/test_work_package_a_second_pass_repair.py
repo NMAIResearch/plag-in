@@ -1,7 +1,4 @@
-"""The three blocking defects of the second independent review, and the fourth.
-
-Each case here reproduces a probe from `CODEX_REVIEW` of work package A, second
-pass, as recorded in `agent_handoff/FROM_CODEX.md` on 2026-08-27:
+"""Regression probes for receipt-store transaction and activation defects.
 
 D1  the transaction lock was opened without refusing a symbolic link, so a link
     planted at `receipts.init.lock` created a regular file outside the state

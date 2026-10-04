@@ -37,7 +37,7 @@ FORBIDDEN_NAMES = {
     "source_" + "manifest.txt",
 }
 FORBIDDEN_PATTERNS = {
-    "private_home_path": re.compile(r"/(?:var/)?home/" + "Noel" + r"(?:/|\b)"),
+    "private_home_path": re.compile(r"/(?:var/)?home/[^/\s]+(?:/|\b)"),
     "restricted_folder": re.compile("Sensitive " + "data|claude " + "memory " + "folders", re.I),
     "github_token": re.compile("gh" + r"[pousr]_[A-Za-z0-9]{20,}"),
     "huggingface_token": re.compile("hf" + r"_[A-Za-z0-9]{20,}"),
