@@ -1,12 +1,42 @@
 # PLAG IN
 
-**Your model. Your device. No outbound telemetry. Verifiable local inference.**
+**Local inference controls with inspectable metadata receipts.**
 
 PLAG IN is an experimental source gateway for direct, inspectable access to local GGUF models. The statement above is the product requirement. It is not a blanket privacy guarantee.
 
-Version `0.1.0a2` supports Linux and Python 3.14 or newer. It does not download models, install a native runtime, execute tools or silently fall back to a remote provider.
+Version `0.1.0a3` supports Linux and Python 3.14 or newer. It does not download models, install a native runtime, execute tools or silently fall back to a remote provider.
 
-## Current evidence
+## Quickstart: try it without a model
+
+You need Linux and Python 3.14 or newer with `venv` and `pip` support. Start in the root of a fresh source checkout, the directory containing `pyproject.toml`. No model or native runtime is needed for installation, the doctor report or the synthetic tests.
+
+**For inference later:** you must already hold a GGUF model and a native `libllama` bundle whose complete component digests match a [registered native ABI profile](src/plag_in/native_profiles.py). An arbitrary `libllama` build is not sufficient. Supporting another build requires a reviewed profile and regression coverage; changing a filename or configuration label cannot admit it.
+
+Create a virtual environment. Run in your terminal:
+
+```text
+python3 -m venv .venv
+```
+
+Install from this checkout. Run in your terminal:
+
+```text
+.venv/bin/python -m pip install .
+```
+
+This source installation may download the declared build dependency, `setuptools>=68`. It does not install a model or native runtime. For a machine without network access, see [Offline installation](#offline-installation).
+
+Check the installed command. Run in your terminal:
+
+```text
+.venv/bin/plag-in doctor --format json
+```
+
+The command should exit successfully and print JSON. With no configuration supplied, `configuration.status` is `not_supplied`, and `locality_controls.status` and `runtime_settings.status` are `unconfigured`. These are expected results, not an installation failure. The report records `model_started: false`; it does not establish native-runtime availability, model compatibility or inference readiness.
+
+You can now run the [synthetic tests](#verify) without a model. If you already have the required native bundle and model, continue to [Interactive setup](#interactive-setup).
+
+## Historical evidence (0.1.0a2)
 
 The public source passed 791 of 791 fixture and integration tests, N = 791, on 2026-08-29.
 
@@ -46,35 +76,43 @@ Historical absence of external traffic during these compatibility trials is unas
 
 PLAG IN is not a model distributor, chat application, agent framework, browser security boundary or substitute for operating-system isolation.
 
-## Install from source
+## Offline installation
+
+Use this alternative only when the build toolchain, including `setuptools>=68` and wheel-building support, is already installed for your chosen Python 3.14 or newer interpreter. It reuses that interpreter's packages for the build; the environment is not isolated from those packages. Start in a fresh source checkout without an existing `.venv`.
 
 Run in your terminal:
 
 ```text
-python3 -m venv .venv
+python3 -m venv --system-site-packages .venv
 ```
 
-Then run in your terminal:
+Confirm the available setuptools version is at least 68. Run in your terminal:
 
 ```text
-.venv/bin/python -m pip install .
+.venv/bin/python -c "import setuptools; print(setuptools.__version__)"
 ```
 
-The source installation may obtain its declared build dependency if it is absent. It never installs a model.
-
-Inspect the host without writing configuration or starting a model:
+Install using that existing build backend, without consulting a package index. Run in your terminal:
 
 ```text
-.venv/bin/plag-in doctor --format json
+.venv/bin/python -m pip install --no-index --no-build-isolation .
 ```
 
-Open the interactive setup:
+Then run the same doctor check from the quickstart. If the build dependency is unavailable or too old, supply it through your normal package-management process before trying this route. Do not lower the requirement in `pyproject.toml`.
+
+## Interactive setup
+
+After installation, open the menu in an interactive terminal. Run in your terminal:
 
 ```text
 .venv/bin/plag-in
 ```
 
-The menu uses the arrow keys and Enter. Configuration replacement, receipt-store creation and native model loading each require confirmation.
+The menu uses the arrow keys and Enter; choose **Exit** or press `q` to close it. Piped or redirected input is not an interactive terminal, and the no-argument command returns usage instead of opening setup.
+
+Choose **Inspect this computer** to view the doctor report. **Choose or configure a local model** recognises the exact registered Qwen2.5 3B model and native bundle at the locations checked by [the setup flow](src/plag_in/setup_flow.py). It is not a general model or runtime installer. If those files do not match, no configuration is written; another GGUF may still be eligible for an explicitly configured unverified trial under [Model admission](#model-admission).
+
+Configuration replacement, receipt-store creation and native model loading each require confirmation. Review the proposed configuration and requested runtime settings before starting a private test chat. The install check alone is not a reason to approve a load.
 
 ## Model admission
 
@@ -97,19 +135,19 @@ PLAG IN exposes authenticated loopback routes for:
 
 Unsupported features are refused by name rather than silently ignored. PLAG IN does not execute tools or create an agent loop.
 
-The current alpha uses a generated local API key. Per-client identities and least-privilege key scopes are not implemented in `0.1.0a2`. Browser-origin and Host-header hardening are also not claimed.
+The current alpha uses a generated local API key. Per-client identities and least-privilege key scopes are not implemented in `0.1.0a3`. Browser-origin and Host-header hardening are also not claimed.
 
 ## Verify
 
-Run in your terminal:
+From the source checkout root, run the full synthetic suite. Installation is not required: `PYTHONPATH=src` makes the source-layout package importable. Run in your terminal:
 
 ```text
-PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -t .
+PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -W error::ResourceWarning -m unittest discover -s tests -t .
 ```
 
-Some tests bind loopback ports. A sandbox that denies socket creation cannot run those tests.
+The suite uses fixture engines and native doubles. Some tests bind loopback ports. A sandbox that denies socket creation cannot run those tests; report that restriction separately, without skipping tests or treating a partial run as a full pass. Plain discovery from an uninstalled checkout without `PYTHONPATH=src` cannot import the package.
 
-Verify a receipt store:
+View the standalone receipt verifier's arguments. Run in your terminal:
 
 ```text
 python3 tools/verify_inference_receipts.py --help
