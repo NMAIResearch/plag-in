@@ -1,3 +1,21 @@
+# PLAG IN 0.1.0a3
+
+## Changes
+
+- Put a model-free source-install quickstart near the top of the README.
+- Reuse `plag-in doctor --format json` as the install check and explain the expected unconfigured report.
+- Document an offline install using an already available build backend, retaining the `setuptools>=68` requirement.
+- State the exact registered native-component requirement before setup, and clarify the limited automatic setup route.
+- Explain the source-path test command, loopback-fixture requirement and interactive-terminal requirement.
+- Keep package metadata and the module version in agreement.
+- Narrow the headline to "Local inference controls with inspectable metadata receipts.", the wording proposed by the project's 30 August red-team review.
+
+## Verification boundary
+
+This release changes documentation and version identifiers only. Installation and synthetic checks do not establish live inference readiness. No new live model, native-runtime, client-compatibility or traffic-capture evidence is claimed. The historical results and all material limits below remain specific to the earlier source alpha.
+
+---
+
 # PLAG IN 0.1.0a2
 
 Purpose: describe the second public source-alpha payload and its verified boundary.
